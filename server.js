@@ -16,8 +16,9 @@ if (!JWT_SECRET) {
 }
 const TOKEN_TTL = '7d';
 const MAX_ACTIVE_INVITES = 10;
+const OFFLINE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 дней
 
-// ---------- База: только логины/пароли/инвайты ----------
+// ---------- База ----------
 const db = new Database(process.env.DB_PATH || 'chat.db');
 db.pragma('journal_mode = WAL');
 db.exec(`
@@ -34,9 +35,18 @@ db.exec(`
     used_by TEXT,
     created_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS offline_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    msg_id TEXT,
+    to_user TEXT NOT NULL,
+    from_user TEXT NOT NULL,
+    text TEXT NOT NULL,
+    ts INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_offline_to ON offline_messages(to_user);
 `);
 
-// Миграция: добавить created_by, если её ещё нет
+// Миграция: created_by в invites (если её ещё нет)
 {
   const cols = db.prepare('PRAGMA table_info(invites)').all().map(c => c.name);
   if (!cols.includes('created_by')) {
@@ -45,7 +55,7 @@ db.exec(`
   }
 }
 
-// ---------- CLI: генерация инвайта из консоли ----------
+// ---------- CLI: генерация инвайта ----------
 if (process.argv[2] === 'invite') {
   const code = crypto.randomBytes(6).toString('hex').toUpperCase();
   db.prepare('INSERT INTO invites (code, created_at) VALUES (?, ?)').run(code, Date.now());
@@ -53,7 +63,7 @@ if (process.argv[2] === 'invite') {
   process.exit(0);
 }
 
-// ---------- Первый запуск: создать инвайт ----------
+// ---------- Первый запуск ----------
 if (db.prepare('SELECT COUNT(*) AS c FROM invites').get().c === 0) {
   const code = crypto.randomBytes(6).toString('hex').toUpperCase();
   db.prepare('INSERT INTO invites (code, created_at) VALUES (?, ?)').run(code, Date.now());
@@ -88,7 +98,6 @@ app.post('/api/register', (req, res) => {
 
   const inv = db.prepare('SELECT * FROM invites WHERE code = ?').get(String(invite).toUpperCase());
   if (!inv || inv.used) return res.status(400).json({ error: 'invalid or used invite' });
-
   if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
     return res.status(409).json({ error: 'username taken' });
   }
@@ -151,11 +160,11 @@ app.delete('/api/invites/:code', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- WebSocket-релей (без хранения) ----------
+// ---------- WebSocket ----------
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-const sockets = new Map();
+const sockets = new Map(); // username -> Set<WebSocket>
 const addSocket = (u, ws) => {
   if (!sockets.has(u)) sockets.set(u, new Set());
   sockets.get(u).add(ws);
@@ -167,35 +176,37 @@ const removeSocket = (u, ws) => {
   if (s.size === 0) sockets.delete(u);
 };
 
-// ---------- Очередь недоставленных сообщений (только RAM) ----------
-const OFFLINE_TTL_MS = 7 * 24 * 60 * 60 * 1000;   // 7 дней
-const OFFLINE_MAX_PER_USER = 500;                  // лимит сообщений на получателя
-const offlineQueue = new Map();                    // username -> [{from,text,ts,id}]
+function deliverPending(ws, username) {
+  const rows = db.prepare(
+    'SELECT id, msg_id, from_user, text, ts FROM offline_messages WHERE to_user = ? ORDER BY id'
+  ).all(username);
+  if (rows.length === 0) return;
 
-function enqueueOffline(to, msg) {
-  if (!offlineQueue.has(to)) offlineQueue.set(to, []);
-  const q = offlineQueue.get(to);
-  q.push(msg);
-  const cutoff = Date.now() - OFFLINE_TTL_MS;
-  while (q.length && q[0].ts < cutoff) q.shift();
-  while (q.length > OFFLINE_MAX_PER_USER) q.shift();
-}
+  // Удаляем доставленное атомарно до отправки, чтобы два соединения не задвоили
+  const ids = rows.map(r => r.id);
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`DELETE FROM offline_messages WHERE id IN (${placeholders})`).run(...ids);
 
-function drainOffline(username) {
-  const q = offlineQueue.get(username);
-  if (!q || q.length === 0) return [];
-  offlineQueue.delete(username);
-  return q;
-}
-
-// Периодическая очистка просроченных
-setInterval(() => {
-  const cutoff = Date.now() - OFFLINE_TTL_MS;
-  for (const [u, q] of offlineQueue) {
-    while (q.length && q[0].ts < cutoff) q.shift();
-    if (q.length === 0) offlineQueue.delete(u);
+  const myConns = sockets.get(username) || new Set([ws]);
+  for (const m of rows) {
+    const payload = JSON.stringify({
+      type: 'msg',
+      from: m.from_user,
+      text: m.text,
+      ts: m.ts,
+      id: m.msg_id,
+      offline: true,
+    });
+    for (const s of myConns) {
+      if (s.readyState === s.OPEN) s.send(payload);
+    }
+    const ss = sockets.get(m.from_user);
+    if (ss) for (const s of ss) if (s.readyState === s.OPEN) {
+      s.send(JSON.stringify({ type: 'delivered', id: m.msg_id, to: username, late: true }));
+    }
   }
-}, 60 * 60 * 1000);
+  console.log(`delivered ${rows.length} offline messages to ${username}`);
+}
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://localhost');
@@ -204,20 +215,14 @@ wss.on('connection', (ws, req) => {
 
   const username = payload.u;
   ws.username = username;
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   addSocket(username, ws);
   ws.send(JSON.stringify({ type: 'ready', username }));
-    // Отдать недоставленные сообщения
-  const pending = drainOffline(username);
-  for (const m of pending) {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ type: 'msg', from: m.from, text: m.text, ts: m.ts, id: m.id, offline: true }));
-    }
-    // Уведомить отправителя, если он онлайн
-    const ss = sockets.get(m.from);
-    if (ss) for (const s of ss) if (s.readyState === s.OPEN) {
-      s.send(JSON.stringify({ type: 'delivered', id: m.id, to: username, late: true }));
-    }
-  }
+
+  // Отдать недоставленные сообщения сразу после подключения
+  try { deliverPending(ws, username); } catch (e) { console.error('deliverPending:', e); }
 
   ws.on('message', (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
@@ -226,24 +231,41 @@ wss.on('connection', (ws, req) => {
     const text = String(m.text || '');
     if (!to || !text || text.length > 8000) return;
 
-    const out = JSON.stringify({ type: 'msg', from: username, text, ts: Date.now(), id: m.id || null });
+    const msgId = m.id || crypto.randomUUID();
+    const ts = Date.now();
+    const out = JSON.stringify({ type: 'msg', from: username, text, ts, id: msgId });
     const rs = sockets.get(to);
 
     if (rs && rs.size > 0) {
       for (const r of rs) if (r.readyState === r.OPEN) r.send(out);
-      ws.send(JSON.stringify({ type: 'delivered', id: m.id || null, to }));
+      ws.send(JSON.stringify({ type: 'delivered', id: msgId, to }));
     } else {
-      enqueueOffline(to, { from: username, text, ts: Date.now(), id: m.id || null });
-      ws.send(JSON.stringify({ type: 'queued', id: m.id || null, to }));
+      db.prepare(
+        'INSERT INTO offline_messages (msg_id, to_user, from_user, text, ts) VALUES (?, ?, ?, ?, ?)'
+      ).run(msgId, to, username, text, ts);
+      ws.send(JSON.stringify({ type: 'queued', id: msgId, to }));
     }
+  });
 
   ws.on('close', () => removeSocket(username, ws));
   ws.on('error', () => removeSocket(username, ws));
 });
 
+// Ping-pong: каждые 30 с проверяем, живы ли сокеты
 const hb = setInterval(() => {
-  for (const ws of wss.clients) if (ws.readyState === ws.OPEN) ws.ping();
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) { try { ws.terminate(); } catch {} continue; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
 }, 30000);
 wss.on('close', () => clearInterval(hb));
+
+// Раз в час чистим старые офлайн-сообщения
+setInterval(() => {
+  const cutoff = Date.now() - OFFLINE_TTL_MS;
+  const r = db.prepare('DELETE FROM offline_messages WHERE ts < ?').run(cutoff);
+  if (r.changes > 0) console.log(`cleanup: removed ${r.changes} expired offline messages`);
+}, 60 * 60 * 1000);
 
 server.listen(PORT, '0.0.0.0', () => console.log(`minichat listening on :${PORT}`));
