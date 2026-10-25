@@ -4,6 +4,9 @@ let me = null, ws = null, currentPeer = null;
 const history = {};
 let historyLoaded = false;
 
+const backBtns = [document.getElementById('back-btn'), document.getElementById('back-btn2')];
+const wsStatus = document.getElementById('ws-status');
+
 // ---------- IndexedDB ----------
 const DB_NAME = 'minichat';
 const DB_VERSION = 1;
@@ -19,11 +22,11 @@ function openDB() {
       if (!db.objectStoreNames.contains(STORE)) {
         const store = db.createObjectStore(STORE, { keyPath: 'id' });
         store.createIndex('user', 'user');
-        store.createIndex('peer', 'peer');
       }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+    req.onblocked = () => reject(new Error('IndexedDB blocked (другая вкладка держит соединение)'));
   });
   return dbPromise;
 }
@@ -31,67 +34,71 @@ function openDB() {
 async function idbPut(rec) {
   try {
     const db = await openDB();
-    return await new Promise((resolve, reject) => {
+    return await new Promise((res, rej) => {
       const tx = db.transaction(STORE, 'readwrite');
       tx.objectStore(STORE).put(rec);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
     });
-  } catch (e) { console.warn('idbPut failed:', e); }
+  } catch (e) { console.warn('[idbPut]', e); }
 }
 
 async function idbGetAll() {
   const db = await openDB();
-  return new Promise((resolve, reject) => {
+  return new Promise((res, rej) => {
     const tx = db.transaction(STORE, 'readonly');
     const req = tx.objectStore(STORE).getAll();
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
   });
 }
 
 async function idbUpdateStatus(user, id, status) {
   try {
     const db = await openDB();
-    await new Promise((resolve, reject) => {
+    await new Promise((res, rej) => {
       const tx = db.transaction(STORE, 'readwrite');
       const store = tx.objectStore(STORE);
-      const req = store.get(id);
-      req.onsuccess = () => {
-        const rec = req.result;
+      const get = store.get(id);
+      get.onsuccess = () => {
+        const rec = get.result;
         if (!rec || rec.user !== user) return;
         rec.status = status;
         store.put(rec);
       };
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
     });
-  } catch (e) { console.warn('idbUpdateStatus failed:', e); }
+  } catch (e) { console.warn('[idbUpdateStatus]', e); }
 }
 
 async function loadHistory() {
   if (historyLoaded || !me) return;
-  historyLoaded = true;
-  for (const k of Object.keys(history)) delete history[k];
   try {
     const all = await idbGetAll();
+    let n = 0;
     for (const r of all) {
       if (r.user !== me) continue;
       let status = r.status || null;
       if (status === 'sending') status = 'unknown';
       if (!history[r.peer]) history[r.peer] = [];
+      if (history[r.peer].some(m => m.id === r.id)) continue;
       history[r.peer].push({
         from: r.from, text: r.text, ts: r.ts, id: r.id,
         status, offline: r.offline,
       });
+      n++;
     }
-    for (const p of Object.keys(history)) {
-      history[p].sort((a, b) => a.ts - b.ts);
-    }
-  } catch (e) { console.warn('loadHistory failed:', e); }
+    for (const p of Object.keys(history)) history[p].sort((a, b) => a.ts - b.ts);
+    historyLoaded = true;
+    console.log(`[minichat] restored ${n} messages for ${me} from IndexedDB`);
+  } catch (e) {
+    console.error('[minichat] loadHistory failed:', e);
+    alert('Не удалось загрузить историю с устройства. Проверьте, что браузер не в приватном режиме.');
+  }
 }
 
-// ---------- Вкладки ----------
+// ---------- Вкладки авторизации ----------
 document.querySelectorAll('.tab').forEach(t => {
   t.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === t));
@@ -137,11 +144,46 @@ $('#register-form').addEventListener('submit', async (e) => {
 
 $('#logout').addEventListener('click', () => {
   localStorage.removeItem('token');
+  localStorage.removeItem('lastPeer');
   if (ws) ws.close();
   location.reload();
 });
 
-// ---------- Чат ----------
+// ---------- Мобильная навигация ----------
+function showList() {
+  currentPeer = null;
+  document.body.classList.add('view-list');
+  document.body.classList.remove('view-chat');
+  document.querySelectorAll('#users li').forEach(li => li.classList.remove('active'));
+}
+
+function selectPeer(u) {
+  currentPeer = u;
+  localStorage.setItem('lastPeer', u);
+  const nameEl = $('#peer-name') || $('#peer');
+  nameEl.textContent = u;
+  $('#send-form').classList.remove('hidden');
+  document.querySelectorAll('#users li').forEach(li => li.classList.toggle('active', li.textContent === u));
+  renderMessages();
+  document.body.classList.remove('view-list');
+  document.body.classList.add('view-chat');
+}
+
+backBtns.forEach(b => { if (b) b.addEventListener('click', showList); });
+window.addEventListener('popstate', showList);
+
+// ---------- Статус WebSocket ----------
+function setWsStatus(state) {
+  if (!wsStatus) return;
+  wsStatus.classList.remove('online', 'offline', 'connecting');
+  wsStatus.classList.add(state);
+  wsStatus.title =
+    state === 'online'     ? 'Соединение активно' :
+    state === 'offline'    ? 'Нет соединения — переподключение...' :
+    'Подключение...';
+}
+
+// ---------- Вход в чат ----------
 async function enterChat() {
   const res = await fetch('/api/me', { headers: { Authorization: 'Bearer ' + token } });
   if (!res.ok) { localStorage.removeItem('token'); location.reload(); return; }
@@ -149,20 +191,47 @@ async function enterChat() {
   $('#me').textContent = me;
   $('#auth').classList.add('hidden');
   $('#chat').classList.remove('hidden');
-  await loadHistory();   // ← восстановление истории с устройства
+  await loadHistory();
   connectWS();
   await loadUsers();
+  if (currentPeer) {
+    document.body.classList.remove('view-list');
+    document.body.classList.add('view-chat');
+  } else {
+    document.body.classList.add('view-list');
+    document.body.classList.remove('view-chat');
+  }
 }
 
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  setWsStatus('connecting');
   ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
-  ws.addEventListener('close', () => { if (token) setTimeout(connectWS, 2000); });
+
+  ws.addEventListener('open', () => {
+    console.log('[minichat] ws connected');
+    setWsStatus('online');
+  });
+
+  ws.addEventListener('close', () => {
+    console.log('[minichat] ws closed, reconnecting in 2s');
+    setWsStatus('offline');
+    if (token) setTimeout(connectWS, 2000);
+  });
+
+  ws.addEventListener('error', (e) => {
+    console.warn('[minichat] ws error', e);
+    setWsStatus('offline');
+  });
+
   ws.addEventListener('message', (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     if (m.type === 'msg') {
-      const id = m.id || ('srv-' + crypto.randomUUID());
-      pushMessage(m.from, { from: m.from, text: m.text, ts: m.ts, id, offline: m.offline });
+      pushMessage(m.from, {
+        from: m.from, text: m.text, ts: m.ts,
+        id: m.id || null,
+        offline: m.offline || false,
+      });
       if (m.from === currentPeer) renderMessages();
     } else if (m.type === 'queued') {
       setStatus(m.to, m.id, 'queued');
@@ -185,19 +254,17 @@ async function loadUsers() {
     li.addEventListener('click', () => selectPeer(u));
     ul.appendChild(li);
   }
+  const last = localStorage.getItem('lastPeer');
+  if (last && users.includes(last)) {
+    selectPeer(last);
+  }
 }
 
-function selectPeer(u) {
-  currentPeer = u;
-  const nameEl = $('#peer-name') || $('#peer');
-  nameEl.textContent = u;
-  $('#send-form').classList.remove('hidden');
-  document.querySelectorAll('#users li').forEach(li => li.classList.toggle('active', li.textContent === u));
-  renderMessages();
-}
-
+// ---------- История в памяти ----------
 function pushMessage(peer, msg) {
   if (!history[peer]) history[peer] = [];
+  if (msg.id && history[peer].some(m => m.id === msg.id)) return;
+  if (!msg.id && history[peer].some(m => m.from === msg.from && m.ts === msg.ts && m.text === msg.text)) return;
   history[peer].push(msg);
   if (me && msg.id) {
     idbPut({
@@ -210,7 +277,7 @@ function pushMessage(peer, msg) {
 
 function setStatus(peer, id, status) {
   const arr = history[peer];
-  if (!arr) return;
+  if (!arr || !id) return;
   for (const m of arr) {
     if (m.id === id) {
       m.status = status;
@@ -238,19 +305,31 @@ function renderMessages() {
   box.scrollTop = box.scrollHeight;
 }
 
+// ---------- Отправка ----------
 $('#send-form').addEventListener('submit', (e) => {
   e.preventDefault();
   const input = $('#text');
   const text = input.value.trim();
-  if (!text || !currentPeer || !ws || ws.readyState !== ws.OPEN) return;
+  if (!text || !currentPeer) return;
+
+  if (!ws || ws.readyState !== ws.OPEN) {
+    setWsStatus('offline');
+    const msgEl = $('#peer-name');
+    const old = msgEl.textContent;
+    msgEl.textContent = 'Нет соединения — переподключение...';
+    setTimeout(() => { msgEl.textContent = old; }, 2500);
+    return;
+  }
+
   const id = crypto.randomUUID();
   ws.send(JSON.stringify({ type: 'msg', to: currentPeer, text, id }));
   pushMessage(currentPeer, { from: me, text, ts: Date.now(), id, status: 'sending' });
   renderMessages();
   input.value = '';
+  input.focus();
 });
 
-// ---------- Приглашения (без изменений) ----------
+// ---------- Приглашения ----------
 const invitesModal = $('#invites-modal');
 
 $('#open-invites').addEventListener('click', () => {
@@ -278,7 +357,6 @@ async function loadInvites() {
   const data = await res.json();
   $('#invites-meta').textContent =
     `Активных: ${data.active} из ${data.limit} · всего создано: ${data.invites.length}`;
-
   const ul = $('#invites-list'); ul.innerHTML = '';
   if (data.invites.length === 0) {
     const li = document.createElement('li');
@@ -287,47 +365,39 @@ async function loadInvites() {
     ul.appendChild(li);
     return;
   }
-
   for (const inv of data.invites) {
     const li = document.createElement('li');
     li.className = 'invite-item' + (inv.used ? ' used' : '');
-
     const code = document.createElement('code');
     code.textContent = inv.code;
     li.appendChild(code);
-
     if (inv.used) {
-      const badge = document.createElement('span');
-      badge.className = 'badge';
-      badge.textContent = inv.used_by ? `использован: ${inv.used_by}` : 'использован';
-      li.appendChild(badge);
+      const b = document.createElement('span');
+      b.className = 'badge';
+      b.textContent = inv.used_by ? `использован: ${inv.used_by}` : 'использован';
+      li.appendChild(b);
     } else {
-      const copyBtn = document.createElement('button');
-      copyBtn.className = 'mini';
-      copyBtn.textContent = 'Скопировать';
-      copyBtn.addEventListener('click', async () => {
+      const copy = document.createElement('button');
+      copy.className = 'mini'; copy.textContent = 'Скопировать';
+      copy.addEventListener('click', async () => {
         const link = `${location.origin}/?invite=${inv.code}`;
         try {
           await navigator.clipboard.writeText(link);
-          copyBtn.textContent = 'Скопировано ✓';
-          setTimeout(() => copyBtn.textContent = 'Скопировать', 1500);
-        } catch {
-          prompt('Скопируйте вручную:', link);
-        }
+          copy.textContent = 'Скопировано ✓';
+          setTimeout(() => copy.textContent = 'Скопировать', 1500);
+        } catch { prompt('Скопируйте вручную:', link); }
       });
-      li.appendChild(copyBtn);
-
-      const delBtn = document.createElement('button');
-      delBtn.className = 'mini danger';
-      delBtn.textContent = 'Удалить';
-      delBtn.addEventListener('click', async () => {
+      li.appendChild(copy);
+      const del = document.createElement('button');
+      del.className = 'mini danger'; del.textContent = 'Удалить';
+      del.addEventListener('click', async () => {
         if (!confirm(`Удалить код ${inv.code}?`)) return;
         try {
           await api('/api/invites/' + encodeURIComponent(inv.code), null, 'DELETE');
           await loadInvites();
         } catch (err) { $('#invites-error').textContent = err.message; }
       });
-      li.appendChild(delBtn);
+      li.appendChild(del);
     }
     ul.appendChild(li);
   }
@@ -343,4 +413,8 @@ if (qInvite) {
   }
 }
 
-if (token) enterChat().catch(() => { localStorage.removeItem('token'); location.reload(); });
+if (token) enterChat().catch(e => {
+  console.error(e);
+  localStorage.removeItem('token');
+  location.reload();
+});

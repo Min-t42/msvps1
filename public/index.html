@@ -2,11 +2,11 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>minichat</title>
 <link rel="stylesheet" href="/style.css">
 </head>
-<body>
+<body class="view-list">
 <div id="auth" class="screen">
   <h1>minichat</h1>
   <div class="tabs">
@@ -29,30 +29,34 @@
 
 <div id="chat" class="screen hidden">
   <header>
+    <button id="back-btn" class="back-btn" aria-label="Назад">←</button>
     <span id="me"></span>
+    <span id="ws-status" class="ws-status" title="Состояние соединения">●</span>
     <div class="header-actions">
       <button id="open-invites">Приглашения</button>
       <button id="logout">Выйти</button>
     </div>
   </header>
   <div class="layout">
-    <aside>
+    <aside id="list-pane">
       <h2>Контакты</h2>
       <ul id="users"></ul>
     </aside>
-    <main>
-      <div id="peer">Выберите собеседника</div>
+    <main id="chat-pane">
+      <div class="peer-bar">
+        <button id="back-btn2" class="back-btn" aria-label="Назад">←</button>
+        <span id="peer-name">Выберите собеседника</span>
+      </div>
       <div id="messages"></div>
-      <form id="send-form" class="hidden">
-        <input id="text" placeholder="Сообщение..." autocomplete="off">
-        <button type="submit">→</button>
+      <form id="send-form" class="send-form hidden">
+        <input id="text" type="text" placeholder="Сообщение..." autocomplete="off" enterkeyhint="send">
+        <button type="submit" aria-label="Отправить">→</button>
       </form>
-      <p class="hint">Сообщения не сохраняются на сервере. История пропадёт при обновлении страницы.</p>
+      <p class="hint">Сообщения хранятся только на этом устройстве. На сервере — только логин, пароль, инвайты.</p>
     </main>
   </div>
 </div>
 
-<!-- Модалка приглашений -->
 <div id="invites-modal" class="modal hidden">
   <div class="modal-box">
     <div class="modal-head">
