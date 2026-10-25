@@ -46,7 +46,6 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_offline_to ON offline_messages(to_user);
 `);
 
-// Миграция: created_by в invites (если её ещё нет)
 {
   const cols = db.prepare('PRAGMA table_info(invites)').all().map(c => c.name);
   if (!cols.includes('created_by')) {
@@ -164,7 +163,7 @@ app.delete('/api/invites/:code', authMiddleware, (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-const sockets = new Map(); // username -> Set<WebSocket>
+const sockets = new Map();
 const addSocket = (u, ws) => {
   if (!sockets.has(u)) sockets.set(u, new Set());
   sockets.get(u).add(ws);
@@ -182,7 +181,6 @@ function deliverPending(ws, username) {
   ).all(username);
   if (rows.length === 0) return;
 
-  // Удаляем доставленное атомарно до отправки, чтобы два соединения не задвоили
   const ids = rows.map(r => r.id);
   const placeholders = ids.map(() => '?').join(',');
   db.prepare(`DELETE FROM offline_messages WHERE id IN (${placeholders})`).run(...ids);
@@ -220,8 +218,8 @@ wss.on('connection', (ws, req) => {
 
   addSocket(username, ws);
   ws.send(JSON.stringify({ type: 'ready', username }));
+  console.log(`[ws] connected: ${username}`);
 
-  // Отдать недоставленные сообщения сразу после подключения
   try { deliverPending(ws, username); } catch (e) { console.error('deliverPending:', e); }
 
   ws.on('message', (raw) => {
@@ -247,11 +245,13 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('close', () => removeSocket(username, ws));
+  ws.on('close', () => {
+    console.log(`[ws] closed: ${username}`);
+    removeSocket(username, ws);
+  });
   ws.on('error', () => removeSocket(username, ws));
 });
 
-// Ping-pong: каждые 30 с проверяем, живы ли сокеты
 const hb = setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.isAlive === false) { try { ws.terminate(); } catch {} continue; }
@@ -261,7 +261,6 @@ const hb = setInterval(() => {
 }, 30000);
 wss.on('close', () => clearInterval(hb));
 
-// Раз в час чистим старые офлайн-сообщения
 setInterval(() => {
   const cutoff = Date.now() - OFFLINE_TTL_MS;
   const r = db.prepare('DELETE FROM offline_messages WHERE ts < ?').run(cutoff);
