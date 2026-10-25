@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>minichat</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="auth" class="screen">
+  <h1>minichat</h1>
+  <div class="tabs">
+    <button class="tab active" data-tab="login">Вход</button>
+    <button class="tab" data-tab="register">Регистрация</button>
+  </div>
+  <form id="login-form" class="form">
+    <input name="username" placeholder="логин" autocomplete="username" required>
+    <input name="password" type="password" placeholder="пароль" autocomplete="current-password" required>
+    <button type="submit">Войти</button>
+  </form>
+  <form id="register-form" class="form hidden">
+    <input name="username" placeholder="логин (3-32, a-z0-9_)" autocomplete="username" required>
+    <input name="password" type="password" placeholder="пароль (мин. 8)" autocomplete="new-password" required>
+    <input name="invite" placeholder="код приглашения" required>
+    <button type="submit">Зарегистрироваться</button>
+  </form>
+  <p id="auth-error" class="error"></p>
+</div>
+
+<div id="chat" class="screen hidden">
+  <header>
+    <span id="me"></span>
+    <div class="header-actions">
+      <button id="open-invites">Приглашения</button>
+      <button id="logout">Выйти</button>
+    </div>
+  </header>
+  <div class="layout">
+    <aside>
+      <h2>Контакты</h2>
+      <ul id="users"></ul>
+    </aside>
+    <main>
+      <div id="peer">Выберите собеседника</div>
+      <div id="messages"></div>
+      <form id="send-form" class="hidden">
+        <input id="text" placeholder="Сообщение..." autocomplete="off">
+        <button type="submit">→</button>
+      </form>
+      <p class="hint">Сообщения не сохраняются на сервере. История пропадёт при обновлении страницы.</p>
+    </main>
+  </div>
+</div>
+
+<!-- Модалка приглашений -->
+<div id="invites-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2>Ваши приглашения</h2>
+      <button id="close-invites" class="icon-btn" aria-label="Закрыть">✕</button>
+    </div>
+    <p id="invites-meta" class="muted"></p>
+    <div class="modal-actions">
+      <button id="new-invite" class="primary">Сгенерировать новый</button>
+    </div>
+    <ul id="invites-list" class="invite-list"></ul>
+    <p id="invites-error" class="error"></p>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
