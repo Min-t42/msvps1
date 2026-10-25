@@ -2,6 +2,94 @@ const $ = (s) => document.querySelector(s);
 let token = localStorage.getItem('token') || null;
 let me = null, ws = null, currentPeer = null;
 const history = {};
+let historyLoaded = false;
+
+// ---------- IndexedDB ----------
+const DB_NAME = 'minichat';
+const DB_VERSION = 1;
+const STORE = 'messages';
+let dbPromise = null;
+
+function openDB() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        const store = db.createObjectStore(STORE, { keyPath: 'id' });
+        store.createIndex('user', 'user');
+        store.createIndex('peer', 'peer');
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return dbPromise;
+}
+
+async function idbPut(rec) {
+  try {
+    const db = await openDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put(rec);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) { console.warn('idbPut failed:', e); }
+}
+
+async function idbGetAll() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbUpdateStatus(user, id, status) {
+  try {
+    const db = await openDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      const req = store.get(id);
+      req.onsuccess = () => {
+        const rec = req.result;
+        if (!rec || rec.user !== user) return;
+        rec.status = status;
+        store.put(rec);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) { console.warn('idbUpdateStatus failed:', e); }
+}
+
+async function loadHistory() {
+  if (historyLoaded || !me) return;
+  historyLoaded = true;
+  for (const k of Object.keys(history)) delete history[k];
+  try {
+    const all = await idbGetAll();
+    for (const r of all) {
+      if (r.user !== me) continue;
+      let status = r.status || null;
+      if (status === 'sending') status = 'unknown';
+      if (!history[r.peer]) history[r.peer] = [];
+      history[r.peer].push({
+        from: r.from, text: r.text, ts: r.ts, id: r.id,
+        status, offline: r.offline,
+      });
+    }
+    for (const p of Object.keys(history)) {
+      history[p].sort((a, b) => a.ts - b.ts);
+    }
+  } catch (e) { console.warn('loadHistory failed:', e); }
+}
 
 // ---------- Вкладки ----------
 document.querySelectorAll('.tab').forEach(t => {
@@ -13,11 +101,9 @@ document.querySelectorAll('.tab').forEach(t => {
 });
 
 async function api(path, body, method = 'POST') {
-  const res = await fetch(path, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
@@ -63,6 +149,7 @@ async function enterChat() {
   $('#me').textContent = me;
   $('#auth').classList.add('hidden');
   $('#chat').classList.remove('hidden');
+  await loadHistory();   // ← восстановление истории с устройства
   connectWS();
   await loadUsers();
 }
@@ -74,10 +161,14 @@ function connectWS() {
   ws.addEventListener('message', (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     if (m.type === 'msg') {
-      pushMessage(m.from, { from: m.from, text: m.text, ts: m.ts });
+      const id = m.id || ('srv-' + crypto.randomUUID());
+      pushMessage(m.from, { from: m.from, text: m.text, ts: m.ts, id, offline: m.offline });
       if (m.from === currentPeer) renderMessages();
-    } else if (m.type === 'undelivered') {
-      pushMessage(m.to, { from: me, text: '⚠ не доставлено (получатель офлайн)', ts: Date.now(), system: true });
+    } else if (m.type === 'queued') {
+      setStatus(m.to, m.id, 'queued');
+      if (m.to === currentPeer) renderMessages();
+    } else if (m.type === 'delivered') {
+      setStatus(m.to, m.id, 'delivered');
       if (m.to === currentPeer) renderMessages();
     }
   });
@@ -98,7 +189,8 @@ async function loadUsers() {
 
 function selectPeer(u) {
   currentPeer = u;
-  $('#peer').textContent = u;
+  const nameEl = $('#peer-name') || $('#peer');
+  nameEl.textContent = u;
   $('#send-form').classList.remove('hidden');
   document.querySelectorAll('#users li').forEach(li => li.classList.toggle('active', li.textContent === u));
   renderMessages();
@@ -107,14 +199,40 @@ function selectPeer(u) {
 function pushMessage(peer, msg) {
   if (!history[peer]) history[peer] = [];
   history[peer].push(msg);
+  if (me && msg.id) {
+    idbPut({
+      id: msg.id, user: me, peer,
+      from: msg.from, text: msg.text, ts: msg.ts,
+      status: msg.status || null, offline: msg.offline || false,
+    });
+  }
+}
+
+function setStatus(peer, id, status) {
+  const arr = history[peer];
+  if (!arr) return;
+  for (const m of arr) {
+    if (m.id === id) {
+      m.status = status;
+      if (me) idbUpdateStatus(me, id, status);
+      return;
+    }
+  }
 }
 
 function renderMessages() {
   const box = $('#messages'); box.innerHTML = '';
+  const icons = { sending: '·', queued: '⏳', delivered: '✓', failed: '✗', unknown: '?' };
   for (const m of (history[currentPeer] || [])) {
     const d = document.createElement('div');
     d.className = 'msg ' + (m.from === me ? 'out' : 'in') + (m.system ? ' system' : '');
     d.textContent = m.text;
+    if (m.status && icons[m.status]) {
+      const s = document.createElement('span');
+      s.className = 'msg-status ' + m.status;
+      s.textContent = icons[m.status];
+      d.appendChild(s);
+    }
     box.appendChild(d);
   }
   box.scrollTop = box.scrollHeight;
@@ -127,12 +245,12 @@ $('#send-form').addEventListener('submit', (e) => {
   if (!text || !currentPeer || !ws || ws.readyState !== ws.OPEN) return;
   const id = crypto.randomUUID();
   ws.send(JSON.stringify({ type: 'msg', to: currentPeer, text, id }));
-  pushMessage(currentPeer, { from: me, text, ts: Date.now() });
+  pushMessage(currentPeer, { from: me, text, ts: Date.now(), id, status: 'sending' });
   renderMessages();
   input.value = '';
 });
 
-// ---------- Приглашения ----------
+// ---------- Приглашения (без изменений) ----------
 const invitesModal = $('#invites-modal');
 
 $('#open-invites').addEventListener('click', () => {
@@ -211,13 +329,11 @@ async function loadInvites() {
       });
       li.appendChild(delBtn);
     }
-
     ul.appendChild(li);
   }
 }
 
 // ---------- Boot ----------
-// Предзаполнить поле приглашения из ?invite=XXX
 const qInvite = new URLSearchParams(location.search).get('invite');
 if (qInvite) {
   const reg = document.querySelector('#register-form [name=invite]');

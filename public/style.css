@@ -66,3 +66,8 @@ button.primary:hover { background: #0ea371; }
 button.mini { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer; }
 button.mini:hover { background: #334155; }
 button.mini.danger { color: #f87171; }
+.msg-status { display: inline-block; margin-left: 6px; font-size: 12px; opacity: .8; }
+.msg-status.delivered { color: #86efac; }
+.msg-status.queued   { color: #fbbf24; }
+.msg-status.failed   { color: #f87171; }
+.msg-status.unknown  { color: #94a3b8; }

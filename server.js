@@ -167,6 +167,36 @@ const removeSocket = (u, ws) => {
   if (s.size === 0) sockets.delete(u);
 };
 
+// ---------- Очередь недоставленных сообщений (только RAM) ----------
+const OFFLINE_TTL_MS = 7 * 24 * 60 * 60 * 1000;   // 7 дней
+const OFFLINE_MAX_PER_USER = 500;                  // лимит сообщений на получателя
+const offlineQueue = new Map();                    // username -> [{from,text,ts,id}]
+
+function enqueueOffline(to, msg) {
+  if (!offlineQueue.has(to)) offlineQueue.set(to, []);
+  const q = offlineQueue.get(to);
+  q.push(msg);
+  const cutoff = Date.now() - OFFLINE_TTL_MS;
+  while (q.length && q[0].ts < cutoff) q.shift();
+  while (q.length > OFFLINE_MAX_PER_USER) q.shift();
+}
+
+function drainOffline(username) {
+  const q = offlineQueue.get(username);
+  if (!q || q.length === 0) return [];
+  offlineQueue.delete(username);
+  return q;
+}
+
+// Периодическая очистка просроченных
+setInterval(() => {
+  const cutoff = Date.now() - OFFLINE_TTL_MS;
+  for (const [u, q] of offlineQueue) {
+    while (q.length && q[0].ts < cutoff) q.shift();
+    if (q.length === 0) offlineQueue.delete(u);
+  }
+}, 60 * 60 * 1000);
+
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://localhost');
   const payload = verifyToken(url.searchParams.get('token'));
@@ -176,6 +206,18 @@ wss.on('connection', (ws, req) => {
   ws.username = username;
   addSocket(username, ws);
   ws.send(JSON.stringify({ type: 'ready', username }));
+    // Отдать недоставленные сообщения
+  const pending = drainOffline(username);
+  for (const m of pending) {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: 'msg', from: m.from, text: m.text, ts: m.ts, id: m.id, offline: true }));
+    }
+    // Уведомить отправителя, если он онлайн
+    const ss = sockets.get(m.from);
+    if (ss) for (const s of ss) if (s.readyState === s.OPEN) {
+      s.send(JSON.stringify({ type: 'delivered', id: m.id, to: username, late: true }));
+    }
+  }
 
   ws.on('message', (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
@@ -191,9 +233,9 @@ wss.on('connection', (ws, req) => {
       for (const r of rs) if (r.readyState === r.OPEN) r.send(out);
       ws.send(JSON.stringify({ type: 'delivered', id: m.id || null, to }));
     } else {
-      ws.send(JSON.stringify({ type: 'undelivered', id: m.id || null, to }));
+      enqueueOffline(to, { from: username, text, ts: Date.now(), id: m.id || null });
+      ws.send(JSON.stringify({ type: 'queued', id: m.id || null, to }));
     }
-  });
 
   ws.on('close', () => removeSocket(username, ws));
   ws.on('error', () => removeSocket(username, ws));
