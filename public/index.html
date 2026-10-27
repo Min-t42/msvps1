@@ -53,10 +53,12 @@
       </div>
       <div id="messages"></div>
       <form id="send-form" class="send-form hidden">
+        <input type="file" id="file-input" accept="image/*,video/*" hidden>
+        <button type="button" id="attach-btn" title="Прикрепить (до 35 МБ)">📎</button>
         <input id="text" type="text" placeholder="Сообщение..." autocomplete="off" enterkeyhint="send">
         <button type="submit" aria-label="Отправить">→</button>
       </form>
-      <p class="hint">E2EE: сервер видит только шифротекст. История хранится на этом устройстве.</p>
+      <p class="hint">E2EE. Файлы до 35 МБ, хранятся на сервере 7 дней. История — на этом устройстве.</p>
     </main>
   </div>
 </div>
@@ -74,8 +76,8 @@
 <div id="unlock-modal" class="modal hidden">
   <div class="modal-box">
     <div class="modal-head"><h2 id="unlock-title">Расшифровка сообщений</h2></div>
-    <p class="muted">Введите пароль, чтобы разблокировать ключ шифрования на этом устройстве.</p>
-    <input id="unlock-password" type="password" placeholder="пароль" autocomplete="current-password" class="modal-input">
+    <p class="muted">Введите пароль, чтобы разблокировать ключ шифрования.</p>
+    <input id="unlock-password" type="password" placeholder="пароль" class="modal-input">
     <button id="unlock-btn" class="primary modal-btn-full">Разблокировать</button>
     <p id="unlock-error" class="error"></p>
     <p class="muted modal-footer-note">Потеря пароля = потеря истории.</p>
@@ -97,7 +99,7 @@
     <section class="settings-section">
       <h3>Ключ шифрования</h3>
       <button id="rotate-key" class="primary">Сменить ключ</button>
-      <p class="muted">Старые сообщения, отправленные до смены ключа, станут недоступны.</p>
+      <p class="muted">Старые сообщения станут недоступны.</p>
     </section>
     <section class="settings-section">
       <h3>Активные сессии</h3>
@@ -106,8 +108,7 @@
     </section>
     <section class="settings-section">
       <h3>История</h3>
-      <button id="clear-history" class="mini danger">Очистить историю на этом устройстве</button>
-      <p class="muted">Сервер историю не хранит.</p>
+      <button id="clear-history" class="mini danger">Очистить историю</button>
     </section>
     <p id="settings-error" class="error"></p>
   </div>
@@ -116,10 +117,20 @@
 <div id="verify-modal" class="modal hidden">
   <div class="modal-box">
     <div class="modal-head"><h2>Проверка собеседника</h2><button id="close-verify" class="icon-btn">✕</button></div>
-    <p class="muted">Сверьте этот код с собеседником по голосу или лично. Если коды совпадают — MITM исключён.</p>
+    <p class="muted">Сверьте код по голосу или лично.</p>
     <pre id="safety-number" class="safety-num"></pre>
     <button id="confirm-verify" class="primary modal-btn-full">Коды совпадают</button>
     <p id="verify-status" class="muted"></p>
+  </div>
+</div>
+
+<div id="progress-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head"><h2 id="progress-title">Передача файла</h2></div>
+    <p id="progress-text" class="muted">Шифрование...</p>
+    <div class="progress-bar"><div id="progress-fill" class="progress-fill"></div></div>
+    <button id="progress-cancel" class="mini danger modal-btn-full">Отмена</button>
+    <p id="progress-error" class="error"></p>
   </div>
 </div>
 

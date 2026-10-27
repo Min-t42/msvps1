@@ -2,17 +2,27 @@ const $ = (s) => document.querySelector(s);
 let token = localStorage.getItem('token') || null;
 let me = null, ws = null, currentPeer = null;
 let identity = null;
-let masterBits = null;     // 256 bits из PBKDF2, для вывода ключей
-let historyKey = null;     // AES-GCM для IndexedDB
+let masterBits = null;
+let historyKey = null;
 let sessionPassword = null;
 const history = {};
 let historyLoaded = false;
+const blobCache = new Map(); // fileId -> { url, mime, filename }
 
 const backBtns = [document.getElementById('back-btn'), document.getElementById('back-btn2')];
 const wsStatus = document.getElementById('ws-status');
 const verifyBtn = document.getElementById('verify-btn');
+const MAX_FILE_SIZE = 35 * 1024 * 1024;
 
 const b64 = { enc: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))), dec: (s) => Uint8Array.from(atob(s), c => c.charCodeAt(0)) };
+const b64Blob = (buf) => {  // для больших буферов
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  return btoa(binary);
+};
+const b64ToBytes = (s) => { const bin = atob(s); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; };
 
 function uuid() {
   if (crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -20,6 +30,11 @@ function uuid() {
     const r = (Math.random() * 16) | 0;
     return (c === 'x' ? r : ((r & 0x3) | 0x8)).toString(16);
   });
+}
+function fmtSize(b) {
+  if (b < 1024) return b + ' Б';
+  if (b < 1024*1024) return (b/1024).toFixed(1) + ' КБ';
+  return (b/1024/1024).toFixed(2) + ' МБ';
 }
 
 // ---------- Crypto ----------
@@ -34,7 +49,6 @@ async function deriveAes(masterBits, info) {
     mk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
   );
 }
-
 async function encryptPrivateKey(privateKey, masterBits) {
   const kek = await deriveAes(masterBits, 'minichat-identity');
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -56,7 +70,6 @@ async function decryptHistoryText(ivB64, ctB64) {
   const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64.dec(ivB64) }, historyKey, b64.dec(ctB64));
   return new TextDecoder().decode(pt);
 }
-
 async function createIdentity(master) {
   const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
   const publicJwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
@@ -64,11 +77,9 @@ async function createIdentity(master) {
   const privateKey = await crypto.subtle.importKey('pkcs8', await crypto.subtle.exportKey('pkcs8', kp.privateKey), { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveKey', 'deriveBits']);
   return { publicJwk, privateKey, encrypted: enc };
 }
-
 async function deriveSharedAesKey(peerPublicKey) {
   return crypto.subtle.deriveKey(
-    { name: 'ECDH', public: peerPublicKey },
-    identity.privateKey,
+    { name: 'ECDH', public: peerPublicKey }, identity.privateKey,
     { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
   );
 }
@@ -85,6 +96,18 @@ async function decryptFrom(peer, ivB64, ctB64) {
   const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64.dec(ivB64) }, aes, b64.dec(ctB64));
   return new TextDecoder().decode(pt);
 }
+async function encryptFileBytes(peer, bytes) {
+  const pk = await getPeerPublicKey(peer);
+  const aes = await deriveSharedAesKey(pk);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aes, bytes);
+  return { iv: b64Blob(iv), ct };
+}
+async function decryptFileBytes(peer, ivB64, ctBuf) {
+  const pk = await getPeerPublicKey(peer);
+  const aes = await deriveSharedAesKey(pk);
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64ToBytes(ivB64) }, aes, ctBuf);
+}
 
 const peerKeyCache = new Map();
 async function getPeerPublicKey(username) {
@@ -97,7 +120,6 @@ async function getPeerPublicKey(username) {
   return key;
 }
 
-// ---------- Safety Number ----------
 async function computeSafetyNumber(myJwk, peerJwk) {
   const a = JSON.stringify(myJwk, Object.keys(myJwk).sort());
   const b = JSON.stringify(peerJwk, Object.keys(peerJwk).sort());
@@ -116,22 +138,18 @@ async function computeSafetyNumber(myJwk, peerJwk) {
 
 // ---------- IndexedDB ----------
 const DB_NAME = 'minichat';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const STORE_MSG = 'messages';
 const STORE_IDENT = 'identity';
 const STORE_VERIFIED = 'verified';
 let dbPromise = null;
-
 function openDB() {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
-      if (!db.objectStoreNames.contains(STORE_MSG)) {
-        const s = db.createObjectStore(STORE_MSG, { keyPath: 'id' });
-        s.createIndex('user', 'user');
-      }
+      if (!db.objectStoreNames.contains(STORE_MSG)) { const s = db.createObjectStore(STORE_MSG, { keyPath: 'id' }); s.createIndex('user', 'user'); }
       if (!db.objectStoreNames.contains(STORE_IDENT)) db.createObjectStore(STORE_IDENT, { keyPath: 'user' });
       if (!db.objectStoreNames.contains(STORE_VERIFIED)) db.createObjectStore(STORE_VERIFIED, { keyPath: 'peer' });
     };
@@ -228,23 +246,33 @@ async function loadHistory() {
     for (const r of all) {
       if (r.user !== me) continue;
       if (cutoff && r.ts < cutoff) continue;
-      let text;
-      try { text = await decryptHistoryText(r.iv, r.ct); }
-      catch (e) { text = '[не удалось расшифровать]'; }
+      let payload;
+      try { payload = JSON.parse(await decryptHistoryText(r.iv, r.ct)); }
+      catch { payload = { kind: 'text', text: '[не удалось расшифровать]' }; }
       let status = r.status || null;
       if (status === 'sending') status = 'unknown';
       if (!history[r.peer]) history[r.peer] = [];
       if (history[r.peer].some(m => m.id === r.id)) continue;
-      history[r.peer].push({ id: r.id, from: r.from, text, ts: r.ts, status, offline: r.offline, senderPubJwk: r.senderPubJwk });
+      history[r.peer].push({
+        id: r.id, from: r.from, ts: r.ts, status, offline: r.offline,
+        senderPubJwk: r.senderPubJwk,
+        kind: payload.kind || 'text',
+        text: payload.text,
+        fileId: payload.fileId,
+        filename: payload.filename,
+        mime: payload.mime,
+        size: payload.size,
+        fileIv: payload.fileIv,
+      });
       n++;
     }
     for (const p of Object.keys(history)) history[p].sort((a, b) => a.ts - b.ts);
     historyLoaded = true;
-    console.log(`[minichat] restored ${n} encrypted messages for ${me}`);
+    console.log(`[minichat] restored ${n} encrypted messages`);
   } catch (e) { console.error('[loadHistory]', e); }
 }
 
-// ---------- Auth UI ----------
+// ---------- Auth ----------
 document.querySelectorAll('.tab').forEach(t => {
   t.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === t));
@@ -252,7 +280,6 @@ document.querySelectorAll('.tab').forEach(t => {
     $('#register-form').classList.toggle('hidden', t.dataset.tab !== 'register');
   });
 });
-
 async function api(path, body, method = 'POST') {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers['Authorization'] = 'Bearer ' + token;
@@ -261,35 +288,27 @@ async function api(path, body, method = 'POST') {
   if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
 }
-
 $('#login-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  $('#auth-error').textContent = '';
-  const f = e.target;
-  const password = f.password.value;
+  e.preventDefault(); $('#auth-error').textContent = '';
+  const f = e.target; const password = f.password.value;
   try {
     const d = await api('/api/login', { username: f.username.value.trim(), password });
-    token = d.token; localStorage.setItem('token', token);
-    sessionPassword = password;
+    token = d.token; localStorage.setItem('token', token); sessionPassword = password;
     await enterChat();
   } catch (err) { $('#auth-error').textContent = err.message; }
 });
 $('#register-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  $('#auth-error').textContent = '';
-  const f = e.target;
-  const password = f.password.value;
+  e.preventDefault(); $('#auth-error').textContent = '';
+  const f = e.target; const password = f.password.value;
   try {
     const d = await api('/api/register', { username: f.username.value.trim(), password, invite: f.invite.value.trim() });
-    token = d.token; localStorage.setItem('token', token);
-    sessionPassword = password;
+    token = d.token; localStorage.setItem('token', token); sessionPassword = password;
     await enterChat();
   } catch (err) { $('#auth-error').textContent = err.message; }
 });
 $('#logout').addEventListener('click', () => {
   localStorage.removeItem('token'); localStorage.removeItem('lastPeer');
-  if (ws) ws.close();
-  location.reload();
+  if (ws) ws.close(); location.reload();
 });
 
 // ---------- Unlock ----------
@@ -297,20 +316,11 @@ function askPassword(title) {
   return new Promise((resolve) => {
     $('#unlock-modal').classList.remove('hidden');
     if (title) $('#unlock-title').textContent = title;
-    $('#unlock-password').value = '';
-    $('#unlock-error').textContent = '';
-    $('#unlock-password').focus();
+    $('#unlock-password').value = ''; $('#unlock-error').textContent = ''; $('#unlock-password').focus();
     const submit = async () => {
-      const pwd = $('#unlock-password').value;
-      if (!pwd) return;
-      try {
-        await unlockWithPassword(pwd);
-        $('#unlock-modal').classList.add('hidden');
-        sessionPassword = pwd;
-        resolve(true);
-      } catch (e) {
-        $('#unlock-error').textContent = 'Неверный пароль';
-      }
+      const pwd = $('#unlock-password').value; if (!pwd) return;
+      try { await unlockWithPassword(pwd); $('#unlock-modal').classList.add('hidden'); sessionPassword = pwd; resolve(true); }
+      catch { $('#unlock-error').textContent = 'Неверный пароль'; }
     };
     $('#unlock-btn').onclick = submit;
     $('#unlock-password').onkeydown = (e) => { if (e.key === 'Enter') submit(); };
@@ -327,21 +337,15 @@ async function ensureIdentity() {
   if (identity && historyKey) return;
   const rec = await idbGetIdentity(me);
   if (rec) {
-    if (sessionPassword) {
-      try { await unlockWithPassword(sessionPassword); return; } catch { sessionPassword = null; }
-    }
-    await askPassword('Расшифровка сообщений');
-    return;
+    if (sessionPassword) { try { await unlockWithPassword(sessionPassword); return; } catch { sessionPassword = null; } }
+    await askPassword('Расшифровка сообщений'); return;
   }
-  // Создание
   let pwd = sessionPassword;
   if (!pwd) {
     pwd = await new Promise((resolve) => {
       $('#unlock-modal').classList.remove('hidden');
       $('#unlock-title').textContent = 'Создание ключа шифрования';
-      $('#unlock-password').value = '';
-      $('#unlock-error').textContent = '';
-      $('#unlock-password').focus();
+      $('#unlock-password').value = ''; $('#unlock-error').textContent = ''; $('#unlock-password').focus();
       const submit = () => { const v = $('#unlock-password').value; if (v) { $('#unlock-modal').classList.add('hidden'); resolve(v); } };
       $('#unlock-btn').onclick = submit;
       $('#unlock-password').onkeydown = (e) => { if (e.key === 'Enter') submit(); };
@@ -360,8 +364,7 @@ async function ensureIdentity() {
 // ---------- Navigation ----------
 function showList() {
   currentPeer = null;
-  document.body.classList.add('view-list');
-  document.body.classList.remove('view-chat');
+  document.body.classList.add('view-list'); document.body.classList.remove('view-chat');
   document.querySelectorAll('#users li').forEach(li => li.classList.remove('active'));
   verifyBtn.classList.add('hidden');
 }
@@ -373,8 +376,7 @@ async function selectPeer(u) {
   verifyBtn.classList.remove('hidden');
   document.querySelectorAll('#users li').forEach(li => li.classList.toggle('active', li.dataset.user === u));
   renderMessages();
-  document.body.classList.remove('view-list');
-  document.body.classList.add('view-chat');
+  document.body.classList.remove('view-list'); document.body.classList.add('view-chat');
   await refreshVerifyStatus();
 }
 backBtns.forEach(b => { if (b) b.addEventListener('click', showList); });
@@ -390,9 +392,9 @@ async function refreshVerifyStatus() {
 verifyBtn.addEventListener('click', async () => {
   if (!currentPeer) return;
   try {
-    const peerJwkRes = await fetch('/api/keys/' + encodeURIComponent(currentPeer), { headers: { Authorization: 'Bearer ' + token } });
-    if (!peerJwkRes.ok) throw new Error('У собеседника нет ключа');
-    const { publicKey: peerJwk } = await peerJwkRes.json();
+    const r = await fetch('/api/keys/' + encodeURIComponent(currentPeer), { headers: { Authorization: 'Bearer ' + token } });
+    if (!r.ok) throw new Error('У собеседника нет ключа');
+    const { publicKey: peerJwk } = await r.json();
     const code = await computeSafetyNumber(identity.publicJwk, peerJwk);
     $('#safety-number').textContent = code;
     $('#verify-modal').classList.remove('hidden');
@@ -423,9 +425,21 @@ function connectWS() {
   ws.addEventListener('message', async (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     if (m.type === 'msg') {
-      let text = null;
-      try { text = await decryptFrom(m.from, m.iv, m.ct); } catch { text = '[не удалось расшифровать]'; }
-      pushMessage(m.from, { id: m.id || null, from: m.from, text, iv: m.iv, ct: m.ct, ts: m.ts, offline: m.offline || false, senderPubJwk: m.senderPubJwk });
+      let payload;
+      try { payload = JSON.parse(await decryptFrom(m.from, m.iv, m.ct)); }
+      catch { payload = { kind: 'text', text: '[не удалось расшифровать]' }; }
+      pushMessage(m.from, {
+        id: m.id || null, from: m.from, ts: m.ts, offline: m.offline || false,
+        senderPubJwk: m.senderPubJwk,
+        kind: payload.kind || 'text',
+        text: payload.text,
+        fileId: payload.fileId,
+        filename: payload.filename,
+        mime: payload.mime,
+        size: payload.size,
+        fileIv: payload.fileIv,
+        iv: m.iv, ct: m.ct,
+      });
       if (m.from === currentPeer) renderMessages();
     } else if (m.type === 'queued') { setStatus(m.to, m.id, 'queued'); if (m.to === currentPeer) renderMessages(); }
     else if (m.type === 'delivered') { setStatus(m.to, m.id, 'delivered'); if (m.to === currentPeer) renderMessages(); }
@@ -482,19 +496,16 @@ $('#search-input').addEventListener('input', (e) => {
       const arr = await res.json();
       const ul = $('#search-results'); ul.innerHTML = '';
       for (const u of arr) {
-        const li = document.createElement('li');
-        li.className = 'invite-item';
+        const li = document.createElement('li'); li.className = 'invite-item';
         const s = document.createElement('span'); s.textContent = u.username; s.style.flex = '1'; li.appendChild(s);
         const btn = document.createElement('button'); btn.className = 'mini'; btn.textContent = 'Открыть';
         btn.addEventListener('click', () => { $('#search-modal').classList.add('hidden'); startChatWith(u.username); });
-        li.appendChild(btn);
-        ul.appendChild(li);
+        li.appendChild(btn); ul.appendChild(li);
       }
     } catch (e) { $('#search-error').textContent = e.message; }
   }, 300);
 });
 async function startChatWith(username) {
-  // Добавляем в список локально, открываем чат
   const ul = $('#users');
   if (![...ul.querySelectorAll('li')].some(li => li.dataset.user === username)) {
     const li = document.createElement('li');
@@ -510,11 +521,11 @@ async function startChatWith(username) {
 function pushMessage(peer, msg) {
   if (!history[peer]) history[peer] = [];
   if (msg.id && history[peer].some(m => m.id === msg.id)) return;
-  history[peer].push({ ...msg, text: msg.text != null ? msg.text : null });
+  history[peer].push(msg);
   if (me && msg.id && msg.iv && msg.ct) {
     idbPutMsg({
-      id: msg.id, user: me, peer,
-      from: msg.from, iv: msg.iv, ct: msg.ct, ts: msg.ts,
+      id: msg.id, user: me, peer, from: msg.from,
+      iv: msg.iv, ct: msg.ct, ts: msg.ts,
       status: msg.status || null, offline: msg.offline || false,
       senderPubJwk: msg.senderPubJwk || null,
     });
@@ -524,13 +535,62 @@ function setStatus(peer, id, status) {
   const arr = history[peer]; if (!arr || !id) return;
   for (const m of arr) if (m.id === id) { m.status = status; if (me) idbUpdateStatus(me, id, status); return; }
 }
+async function getBlobUrl(msg) {
+  if (!msg.fileId) return null;
+  if (blobCache.has(msg.fileId)) return blobCache.get(msg.fileId);
+  const r = await fetch('/api/files/' + encodeURIComponent(msg.fileId), { headers: { Authorization: 'Bearer ' + token } });
+  if (!r.ok) throw new Error('Не удалось скачать файл');
+  const encBuf = await r.arrayBuffer();
+  const other = msg.from === me ? msg.to : msg.from;
+  const peer = msg.from === me ? msg.peer : msg.from;
+  const peerName = msg.peer || msg.from;   // собеседник
+  const sharedPeer = (msg.from === me) ? msg.peer : msg.from;
+  const plain = await decryptFileBytes(sharedPeer, msg.fileIv, encBuf);
+  const blob = new Blob([plain], { type: msg.mime || 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  blobCache.set(msg.fileId, url);
+  return url;
+}
+
 function renderMessages() {
   const box = $('#messages'); box.innerHTML = '';
   const icons = { pending: '⏳', sending: '·', queued: '⏳', delivered: '✓', failed: '✗', unknown: '?' };
   for (const m of (history[currentPeer] || [])) {
     const d = document.createElement('div');
-    d.className = 'msg ' + (m.from === me ? 'out' : 'in') + (m.system ? ' system' : '');
-    d.textContent = m.text != null ? m.text : '…';
+    d.className = 'msg ' + (m.from === me ? 'out' : 'in') + (m.system ? ' system' : '') + (m.kind === 'file' ? ' file' : '');
+    if (m.kind === 'file') {
+      const card = document.createElement('div'); card.className = 'file-card';
+      if ((m.mime || '').startsWith('image/')) {
+        const img = document.createElement('img'); img.className = 'file-thumb'; img.alt = m.filename || 'image';
+        card.appendChild(img);
+        getBlobUrl(m).then(url => { if (url) img.src = url; }).catch(() => {
+          const ph = document.createElement('div'); ph.className = 'file-thumb-placeholder'; ph.textContent = '🖼'; card.replaceChild(ph, img);
+        });
+      } else {
+        const ph = document.createElement('div'); ph.className = 'file-thumb-placeholder';
+        ph.textContent = (m.mime || '').startsWith('video/') ? '🎬' : '📄';
+        card.appendChild(ph);
+      }
+      const meta = document.createElement('div'); meta.className = 'file-meta';
+      const name = document.createElement('div'); name.className = 'file-name'; name.textContent = m.filename || 'файл';
+      const size = document.createElement('div'); size.className = 'file-size'; size.textContent = fmtSize(m.size || 0);
+      const action = document.createElement('a'); action.className = 'file-action'; action.textContent = 'Открыть';
+      action.onclick = async (ev) => {
+        ev.preventDefault();
+        try {
+          const url = await getBlobUrl(m);
+          if (!url) return;
+          if ((m.mime || '').startsWith('video/') || (m.mime || '').startsWith('image/')) window.open(url, '_blank');
+          else {
+            const a = document.createElement('a'); a.href = url; a.download = m.filename || 'file'; a.click();
+          }
+        } catch (e) { alert(e.message); }
+      };
+      meta.appendChild(name); meta.appendChild(size); meta.appendChild(action);
+      card.appendChild(meta); d.appendChild(card);
+    } else {
+      d.textContent = m.text != null ? m.text : '…';
+    }
     if (m.status && icons[m.status]) {
       const s = document.createElement('span'); s.className = 'msg-status ' + m.status; s.textContent = icons[m.status]; d.appendChild(s);
     }
@@ -539,29 +599,104 @@ function renderMessages() {
   box.scrollTop = box.scrollHeight;
 }
 
-// ---------- Send ----------
+// ---------- Send text ----------
 $('#send-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const input = $('#text');
   const text = input.value.trim();
   if (!text) return;
   if (!currentPeer) { alert('Сначала выберите собеседника'); return; }
-  if (!identity) { alert('Ключ шифрования не разблокирован'); return; }
+  if (!identity) { alert('Ключ не разблокирован'); return; }
   const id = uuid();
   const ts = Date.now();
   let enc;
-  try { enc = await encryptFor(currentPeer, text); }
+  try { enc = await encryptFor(currentPeer, JSON.stringify({ kind: 'text', text })); }
   catch (err) { alert('Не удалось зашифровать: ' + err.message); return; }
   if (ws && ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify({ type: 'msg', to: currentPeer, id, iv: enc.iv, ct: enc.ct, senderPubJwk: identity.publicJwk }));
-    pushMessage(currentPeer, { id, from: me, text, iv: enc.iv, ct: enc.ct, ts, status: 'sending', senderPubJwk: identity.publicJwk });
+    pushMessage(currentPeer, { id, from: me, kind: 'text', text, ts, status: 'sending', senderPubJwk: identity.publicJwk });
   } else {
-    pushMessage(currentPeer, { id, from: me, text, iv: enc.iv, ct: enc.ct, ts, status: 'pending', senderPubJwk: identity.publicJwk });
+    pushMessage(currentPeer, { id, from: me, kind: 'text', text, ts, status: 'pending', senderPubJwk: identity.publicJwk });
     setWsStatus('offline');
   }
-  renderMessages();
-  input.value = ''; input.focus();
+  renderMessages(); input.value = ''; input.focus();
 });
+
+// ---------- Send file ----------
+$('#attach-btn').addEventListener('click', () => $('#file-input').click());
+$('#file-input').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  if (!currentPeer) { alert('Сначала выберите собеседника'); return; }
+  if (!identity) { alert('Ключ не разблокирован'); return; }
+  if (file.size > MAX_FILE_SIZE) { alert(`Файл слишком большой: ${fmtSize(file.size)}. Максимум 35 МБ.`); return; }
+  if (file.size === 0) { alert('Пустой файл'); return; }
+  try {
+    await sendFile(file);
+  } catch (err) { alert('Ошибка отправки файла: ' + err.message); }
+});
+
+function showProgress(title) {
+  $('#progress-title').textContent = title || 'Передача файла';
+  $('#progress-text').textContent = 'Подготовка...';
+  $('#progress-fill').style.width = '0%';
+  $('#progress-error').textContent = '';
+  $('#progress-modal').classList.remove('hidden');
+}
+function updateProgress(pct, text) {
+  $('#progress-fill').style.width = Math.max(0, Math.min(100, pct * 100)).toFixed(1) + '%';
+  if (text) $('#progress-text').textContent = text;
+}
+function hideProgress() { $('#progress-modal').classList.add('hidden'); }
+
+async function uploadEncrypted(bytes, peer, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/files/upload');
+    xhr.setRequestHeader('Authorization', 'Bearer ' + token);
+    xhr.setRequestHeader('X-Peer', peer);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch (e) { reject(new Error('bad response')); }
+      } else {
+        let msg = 'HTTP ' + xhr.status;
+        try { const j = JSON.parse(xhr.responseText); if (j.error) msg = j.error; } catch {}
+        reject(new Error(msg));
+      }
+    };
+    xhr.onerror = () => reject(new Error('network error'));
+    xhr.send(new Blob([bytes], { type: 'application/octet-stream' }));
+  });
+}
+
+async function sendFile(file) {
+  showProgress('Шифрование');
+  updateProgress(0, 'Чтение файла...');
+  const plainBuf = await file.arrayBuffer();
+  updateProgress(0.1, 'Шифрование...');
+  const { iv: fileIv, ct: encCt } = await encryptFileBytes(currentPeer, plainBuf);
+  updateProgress(0.3, 'Загрузка на сервер...');
+  const { fileId } = await uploadEncrypted(encCt, currentPeer, (p) => updateProgress(0.3 + p * 0.6, 'Загрузка: ' + Math.round(p * 100) + '%'));
+  updateProgress(0.95, 'Отправка сообщения...');
+  const id = uuid();
+  const ts = Date.now();
+  const meta = { kind: 'file', fileId, filename: file.name, mime: file.type || 'application/octet-stream', size: plainBuf.byteLength, fileIv };
+  const enc = await encryptFor(currentPeer, JSON.stringify(meta));
+  if (ws && ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify({ type: 'msg', to: currentPeer, id, iv: enc.iv, ct: enc.ct, senderPubJwk: identity.publicJwk }));
+    pushMessage(currentPeer, { id, from: me, ts, status: 'sending', senderPubJwk: identity.publicJwk, ...meta });
+  } else {
+    pushMessage(currentPeer, { id, from: me, ts, status: 'pending', senderPubJwk: identity.publicJwk, ...meta });
+  }
+  renderMessages();
+  updateProgress(1, 'Готово');
+  setTimeout(hideProgress, 600);
+}
+$('#progress-cancel').addEventListener('click', () => hideProgress());
 
 // ---------- Invites ----------
 const invitesModal = $('#invites-modal');
@@ -581,8 +716,7 @@ async function loadInvites() {
   const ul = $('#invites-list'); ul.innerHTML = '';
   if (data.invites.length === 0) { const li = document.createElement('li'); li.className = 'muted'; li.textContent = 'Пока нет кодов.'; ul.appendChild(li); return; }
   for (const inv of data.invites) {
-    const li = document.createElement('li');
-    li.className = 'invite-item' + (inv.used ? ' used' : '');
+    const li = document.createElement('li'); li.className = 'invite-item' + (inv.used ? ' used' : '');
     const code = document.createElement('code'); code.textContent = inv.code; li.appendChild(code);
     if (inv.used) {
       const b = document.createElement('span'); b.className = 'badge'; b.textContent = inv.used_by ? `использован: ${inv.used_by}` : 'использован'; li.appendChild(b);
@@ -590,7 +724,7 @@ async function loadInvites() {
       const copy = document.createElement('button'); copy.className = 'mini'; copy.textContent = 'Скопировать';
       copy.addEventListener('click', async () => {
         const link = `${location.origin}/?invite=${inv.code}`;
-        try { await navigator.clipboard.writeText(link); copy.textContent = 'Скопировано ✓'; setTimeout(() => copy.textContent = 'Скопировать', 1500); }
+        try { await navigator.clipboard.writeText(link); copy.textContent = '✓'; setTimeout(() => copy.textContent = 'Скопировать', 1500); }
         catch { prompt('Скопируйте:', link); }
       });
       li.appendChild(copy);
@@ -607,19 +741,12 @@ async function loadInvites() {
 }
 
 // ---------- Settings ----------
-$('#open-settings').addEventListener('click', () => {
-  $('#settings-modal').classList.remove('hidden');
-  loadSessions();
-});
+$('#open-settings').addEventListener('click', () => { $('#settings-modal').classList.remove('hidden'); loadSessions(); });
 $('#close-settings').addEventListener('click', () => $('#settings-modal').classList.add('hidden'));
-
 $('#rotate-key').addEventListener('click', async () => {
   if (!confirm('Сменить ключ? Старые сообщения станут недоступны.')) return;
   try {
-    const pwd = sessionPassword || await new Promise((resolve) => {
-      const p = prompt('Введите пароль для нового ключа:');
-      if (p) resolve(p);
-    });
+    const pwd = sessionPassword || prompt('Введите пароль для нового ключа:');
     if (!pwd) return;
     const salt = crypto.getRandomValues(new Uint8Array(16));
     masterBits = await deriveMaster(pwd, salt);
@@ -627,12 +754,11 @@ $('#rotate-key').addEventListener('click', async () => {
     const { publicJwk, privateKey, encrypted } = await createIdentity(masterBits);
     await idbPutIdentity({ user: me, publicJwk, encrypted, salt: b64.enc(salt) });
     identity = { publicJwk, privateKey };
-    peerKeyCache.clear();
+    peerKeyCache.clear(); blobCache.clear();
     await api('/api/keys', { publicKey: publicJwk });
-    alert('Ключ обновлён. Собеседники должны заново получить ваш ключ.');
+    alert('Ключ обновлён.');
   } catch (e) { $('#settings-error').textContent = e.message; }
 });
-
 async function loadSessions() {
   const ul = $('#sessions-list'); ul.innerHTML = '';
   try {
@@ -640,12 +766,9 @@ async function loadSessions() {
     if (!res.ok) return;
     const arr = await res.json();
     for (const s of arr) {
-      const li = document.createElement('li');
-      li.className = 'invite-item' + (s.revoked ? ' used' : '');
-      const info = document.createElement('span');
-      info.style.flex = '1';
-      const dt = new Date(s.last_seen).toLocaleString();
-      info.textContent = `${s.current ? 'Это устройство · ' : ''}${dt} · ${s.ip || ''} · ${(s.user_agent || '').slice(0, 40)}`;
+      const li = document.createElement('li'); li.className = 'invite-item' + (s.revoked ? ' used' : '');
+      const info = document.createElement('span'); info.style.flex = '1';
+      info.textContent = `${s.current ? 'Это устройство · ' : ''}${new Date(s.last_seen).toLocaleString()} · ${(s.user_agent || '').slice(0, 40)}`;
       li.appendChild(info);
       if (!s.current && !s.revoked) {
         const btn = document.createElement('button'); btn.className = 'mini danger'; btn.textContent = 'Завершить';
@@ -666,9 +789,11 @@ $('#revoke-others').addEventListener('click', async () => {
   catch (e) { $('#settings-error').textContent = e.message; }
 });
 $('#clear-history').addEventListener('click', async () => {
-  if (!confirm('Очистить историю на этом устройстве? Восстановить нельзя.')) return;
+  if (!confirm('Очистить историю на этом устройстве?')) return;
   await idbClearAll(me);
   for (const k of Object.keys(history)) delete history[k];
+  for (const url of blobCache.values()) URL.revokeObjectURL(url);
+  blobCache.clear();
   historyLoaded = false;
   await loadHistory();
   renderMessages();
@@ -682,7 +807,7 @@ async function selfTest() {
     const dec = await decryptFrom(me, enc.iv, enc.ct);
     if (dec !== testText) throw new Error('decrypt mismatch');
     console.log('[self-test] E2EE OK');
-  } catch (e) { console.error('[self-test] E2EE FAILED', e); alert('Ошибка шифрования. Проверьте консоль.'); }
+  } catch (e) { console.error('[self-test] FAILED', e); }
 }
 
 // ---------- Enter chat ----------
@@ -703,13 +828,8 @@ async function enterChat() {
   connectWS();
   await loadUsers();
   await selfTest();
-  if (currentPeer) {
-    document.body.classList.remove('view-list');
-    document.body.classList.add('view-chat');
-  } else {
-    document.body.classList.add('view-list');
-    document.body.classList.remove('view-chat');
-  }
+  if (currentPeer) { document.body.classList.remove('view-list'); document.body.classList.add('view-chat'); }
+  else { document.body.classList.add('view-list'); document.body.classList.remove('view-chat'); }
 }
 
 // ---------- Boot ----------

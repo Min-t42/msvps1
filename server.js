@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const path = require('path');
+const fs = require('fs');
 const { WebSocketServer } = require('ws');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
@@ -14,8 +15,14 @@ if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET missing'); process.exit(1); 
 const TOKEN_TTL = '7d';
 const MAX_ACTIVE_INVITES = 10;
 const OFFLINE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const WS_ALERT_THRESHOLD = 20;   // закрытий за минуту
+const FILES_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_FILE_SIZE = 35 * 1024 * 1024;       // 35 MB
+const MAX_FILE_SIZE_BODY = 36 * 1024 * 1024;  // + запас на GCM-тег
+const WS_ALERT_THRESHOLD = 20;
 const WS_ALERT_WINDOW = 60 * 1000;
+
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const db = new Database(process.env.DB_PATH || 'chat.db');
 db.pragma('journal_mode = WAL');
@@ -68,9 +75,18 @@ db.exec(`
     revoked INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(username);
+
+  CREATE TABLE IF NOT EXISTS files (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    peer TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner);
+  CREATE INDEX IF NOT EXISTS idx_files_peer ON files(peer);
 `);
 
-// Миграции
 {
   const cols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
   if (!cols.includes('public_key')) { db.exec('ALTER TABLE users ADD COLUMN public_key TEXT'); console.log('migration: users.public_key'); }
@@ -81,9 +97,9 @@ db.exec(`
 }
 {
   const cols = db.prepare('PRAGMA table_info(offline_messages)').all().map(c => c.name);
-  if (!cols.includes('iv')) { db.exec('ALTER TABLE offline_messages ADD COLUMN iv TEXT'); console.log('migration: offline_messages.iv'); }
-  if (!cols.includes('ct')) { db.exec('ALTER TABLE offline_messages ADD COLUMN ct TEXT'); console.log('migration: offline_messages.ct'); }
-  if (!cols.includes('sender_pub_jwk')) { db.exec('ALTER TABLE offline_messages ADD COLUMN sender_pub_jwk TEXT'); console.log('migration: offline_messages.sender_pub_jwk'); }
+  if (!cols.includes('iv')) { db.exec('ALTER TABLE offline_messages ADD COLUMN iv TEXT'); }
+  if (!cols.includes('ct')) { db.exec('ALTER TABLE offline_messages ADD COLUMN ct TEXT'); }
+  if (!cols.includes('sender_pub_jwk')) { db.exec('ALTER TABLE offline_messages ADD COLUMN sender_pub_jwk TEXT'); }
   const r = db.prepare('DELETE FROM offline_messages WHERE iv IS NULL OR ct IS NULL').run();
   if (r.changes > 0) console.log(`migration: removed ${r.changes} unencrypted offline messages`);
 }
@@ -122,6 +138,37 @@ const app = express();
 app.use(express.json({ limit: '64kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ---------- Files (35 MB) ----------
+app.use('/api/files/upload', express.raw({ type: 'application/octet-stream', limit: '40mb' }));
+
+app.post('/api/files/upload', authMiddleware, (req, res) => {
+  const peer = String(req.headers['x-peer'] || '').trim();
+  if (!peer) return res.status(400).json({ error: 'X-Peer required' });
+  if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(peer)) return res.status(404).json({ error: 'peer not found' });
+  if (!Buffer.isBuffer(req.body) || req.body.length === 0) return res.status(400).json({ error: 'empty body' });
+  if (req.body.length > MAX_FILE_SIZE_BODY) return res.status(413).json({ error: 'too large', max: MAX_FILE_SIZE });
+
+  const id = crypto.randomUUID();
+  const filePath = path.join(UPLOAD_DIR, id);
+  try { fs.writeFileSync(filePath, req.body); }
+  catch (e) { console.error('write file:', e); return res.status(500).json({ error: 'storage error' }); }
+  db.prepare('INSERT INTO files (id, owner, peer, size, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(id, req.username, peer, req.body.length, Date.now());
+  res.json({ fileId: id, size: req.body.length });
+});
+
+app.get('/api/files/:fileId', authMiddleware, (req, res) => {
+  const row = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.fileId);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (row.owner !== req.username && row.peer !== req.username) return res.status(403).json({ error: 'forbidden' });
+  const filePath = path.join(UPLOAD_DIR, row.id);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'file missing' });
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Length', row.size);
+  fs.createReadStream(filePath).pipe(res);
+});
+
+// ---------- Auth ----------
 app.post('/api/register', (req, res) => {
   const { username, password, invite } = req.body || {};
   if (!username || !password || !invite) return res.status(400).json({ error: 'missing fields' });
@@ -136,9 +183,8 @@ app.post('/api/register', (req, res) => {
     db.prepare('UPDATE invites SET used = 1, used_by = ? WHERE code = ?').run(username, inv.code);
   })();
   const jti = crypto.randomUUID();
-  const ua = String(req.headers['user-agent'] || '').slice(0, 200);
-  const ip = req.ip || req.socket.remoteAddress || '';
-  db.prepare('INSERT INTO sessions (jti, username, created_at, last_seen, user_agent, ip) VALUES (?, ?, ?, ?, ?, ?)').run(jti, username, Date.now(), Date.now(), ua, ip);
+  db.prepare('INSERT INTO sessions (jti, username, created_at, last_seen, user_agent, ip) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(jti, username, Date.now(), Date.now(), String(req.headers['user-agent'] || '').slice(0, 200), req.ip || '');
   res.json({ token: signToken(username, jti), username });
 });
 
@@ -148,15 +194,13 @@ app.post('/api/login', (req, res) => {
   const row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
   if (!row || !bcrypt.compareSync(password, row.password_hash)) return res.status(401).json({ error: 'invalid credentials' });
   const jti = crypto.randomUUID();
-  const ua = String(req.headers['user-agent'] || '').slice(0, 200);
-  const ip = req.ip || req.socket.remoteAddress || '';
-  db.prepare('INSERT INTO sessions (jti, username, created_at, last_seen, user_agent, ip) VALUES (?, ?, ?, ?, ?, ?)').run(jti, username, Date.now(), Date.now(), ua, ip);
+  db.prepare('INSERT INTO sessions (jti, username, created_at, last_seen, user_agent, ip) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(jti, username, Date.now(), Date.now(), String(req.headers['user-agent'] || '').slice(0, 200), req.ip || '');
   res.json({ token: signToken(username, jti), username });
 });
 
 app.get('/api/me', authMiddleware, (req, res) => res.json({ username: req.username }));
 
-// Только собеседники из dialogs
 app.get('/api/users', authMiddleware, (req, res) => {
   const rows = db.prepare(`
     SELECT u.username, u.public_key
@@ -171,15 +215,13 @@ app.get('/api/users', authMiddleware, (req, res) => {
   res.json(rows.map(r => ({ username: r.username, hasKey: !!r.public_key })));
 });
 
-// Поиск пользователей для нового чата
 app.get('/api/users/search', authMiddleware, (req, res) => {
   const q = String(req.query.q || '').trim();
   if (q.length < 2) return res.json([]);
   const rows = db.prepare(`
     SELECT username, public_key FROM users
     WHERE username LIKE ? AND username != ?
-    ORDER BY username
-    LIMIT 10
+    ORDER BY username LIMIT 10
   `).all(`%${q}%`, req.username);
   res.json(rows.map(r => ({ username: r.username, hasKey: !!r.public_key })));
 });
@@ -188,7 +230,7 @@ app.post('/api/keys', authMiddleware, (req, res) => {
   const { publicKey } = req.body || {};
   if (!publicKey || typeof publicKey !== 'object') return res.status(400).json({ error: 'invalid key' });
   if (publicKey.kty !== 'EC' || publicKey.crv !== 'P-256' || !publicKey.x || !publicKey.y) {
-    return res.status(400).json({ error: 'unsupported key (need EC P-256 JWK)' });
+    return res.status(400).json({ error: 'unsupported key' });
   }
   db.prepare('UPDATE users SET public_key = ? WHERE username = ?').run(JSON.stringify(publicKey), req.username);
   res.json({ ok: true });
@@ -225,18 +267,15 @@ app.delete('/api/invites/:code', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-// Сессии
 app.get('/api/sessions', authMiddleware, (req, res) => {
   const rows = db.prepare('SELECT jti, created_at, last_seen, user_agent, ip, revoked FROM sessions WHERE username = ? ORDER BY last_seen DESC').all(req.username);
   res.json(rows.map(r => ({ ...r, current: r.jti === req.jti })));
 });
-
 app.delete('/api/sessions/:jti', authMiddleware, (req, res) => {
   const r = db.prepare('UPDATE sessions SET revoked = 1 WHERE jti = ? AND username = ?').run(req.params.jti, req.username);
   if (r.changes === 0) return res.status(404).json({ error: 'not found' });
   res.json({ ok: true });
 });
-
 app.delete('/api/sessions', authMiddleware, (req, res) => {
   const r = db.prepare('UPDATE sessions SET revoked = 1 WHERE username = ? AND jti != ?').run(req.username, req.jti);
   res.json({ ok: true, revoked: r.changes });
@@ -272,20 +311,15 @@ function deliverPending(ws, username) {
     const ss = sockets.get(m.from_user);
     if (ss) for (const s of ss) if (s.readyState === s.OPEN) s.send(JSON.stringify({ type: 'delivered', id: m.msg_id, to: username, late: true }));
   }
-  console.log(`delivered ${rows.length} offline messages to ${username}`);
 }
 
-// Алерт по закрытиям
 const closeEvents = new Map();
 function recordClose(username) {
   const now = Date.now();
   if (!closeEvents.has(username)) closeEvents.set(username, []);
   const arr = closeEvents.get(username).filter(t => now - t < WS_ALERT_WINDOW);
-  arr.push(now);
-  closeEvents.set(username, arr);
-  if (arr.length >= WS_ALERT_THRESHOLD) {
-    console.warn(`[ALERT] ${arr.length} ws closes for ${username} in ${WS_ALERT_WINDOW/1000}s`);
-  }
+  arr.push(now); closeEvents.set(username, arr);
+  if (arr.length >= WS_ALERT_THRESHOLD) console.warn(`[ALERT] ${arr.length} ws closes for ${username}`);
 }
 
 wss.on('connection', (ws, req) => {
@@ -294,17 +328,12 @@ wss.on('connection', (ws, req) => {
   if (!payload) { ws.close(4001, 'unauthorized'); return; }
   const s = db.prepare('SELECT revoked FROM sessions WHERE jti = ?').get(payload.jti);
   if (!s || s.revoked) { ws.close(4001, 'session revoked'); return; }
-
   const username = payload.u;
-  ws.username = username;
-  ws.isAlive = true;
+  ws.username = username; ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
-
   addSocket(username, ws);
   ws.send(JSON.stringify({ type: 'ready', username }));
-  console.log(`[ws] connected: ${username}`);
-
-  try { deliverPending(ws, username); } catch (e) { console.error('deliverPending:', e); }
+  try { deliverPending(ws, username); } catch (e) { console.error(e); }
 
   ws.on('message', (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
@@ -313,7 +342,7 @@ wss.on('connection', (ws, req) => {
     const iv = String(m.iv || '');
     const ct = String(m.ct || '');
     const senderJwk = m.senderPubJwk && typeof m.senderPubJwk === 'object' ? JSON.stringify(m.senderPubJwk) : null;
-    if (!to || !iv || !ct || iv.length > 64 || ct.length > 20000) return;
+    if (!to || !iv || !ct || iv.length > 64 || ct.length > 30000) return;
     const msgId = m.id || crypto.randomUUID();
     const ts = Date.now();
     const out = JSON.stringify({ type: 'msg', from: username, iv, ct, senderPubJwk: senderJwk ? JSON.parse(senderJwk) : null, ts, id: msgId });
@@ -335,8 +364,7 @@ wss.on('connection', (ws, req) => {
 const hb = setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.isAlive === false) { try { ws.terminate(); } catch {} continue; }
-    ws.isAlive = false;
-    try { ws.ping(); } catch {}
+    ws.isAlive = false; try { ws.ping(); } catch {}
   }
 }, 30000);
 wss.on('close', () => clearInterval(hb));
@@ -344,7 +372,17 @@ wss.on('close', () => clearInterval(hb));
 setInterval(() => {
   const cutoff = Date.now() - OFFLINE_TTL_MS;
   const r = db.prepare('DELETE FROM offline_messages WHERE ts < ?').run(cutoff);
-  if (r.changes > 0) console.log(`cleanup: removed ${r.changes} expired offline messages`);
+  if (r.changes > 0) console.log(`cleanup: offline ${r.changes}`);
+}, 60 * 60 * 1000);
+
+setInterval(() => {
+  const cutoff = Date.now() - FILES_TTL_MS;
+  const old = db.prepare('SELECT id FROM files WHERE created_at < ?').all(cutoff);
+  for (const r of old) {
+    try { fs.unlinkSync(path.join(UPLOAD_DIR, r.id)); } catch {}
+    db.prepare('DELETE FROM files WHERE id = ?').run(r.id);
+  }
+  if (old.length) console.log(`cleanup: files ${old.length}`);
 }, 60 * 60 * 1000);
 
 server.listen(PORT, '0.0.0.0', () => console.log(`minichat listening on :${PORT}`));
