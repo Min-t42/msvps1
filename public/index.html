@@ -80,7 +80,10 @@
     <input id="unlock-password" type="password" placeholder="пароль" class="modal-input">
     <button id="unlock-btn" class="primary modal-btn-full">Разблокировать</button>
     <p id="unlock-error" class="error"></p>
-    <p class="muted modal-footer-note">Потеря пароля = потеря истории.</p>
+    <p class="muted modal-footer-note">
+      Пароль шифрования — это тот, которым вы <b>регистрировались</b>. Если меняли пароль входа через консоль — он не подойдёт.
+    </p>
+    <button id="unlock-reset" class="mini danger modal-btn-full" style="margin-top:8px">Забыл пароль — сбросить ключ (потеря истории)</button>
   </div>
 </div>
 
@@ -97,9 +100,20 @@
   <div class="modal-box">
     <div class="modal-head"><h2>Настройки</h2><button id="close-settings" class="icon-btn">✕</button></div>
     <section class="settings-section">
+      <h3>Пароль входа</h3>
+      <button id="change-password" class="primary">Сменить пароль входа</button>
+      <p class="muted">Обновляет пароль для входа на сервере и перешифровывает текущий ключ E2EE. История сохраняется.</p>
+    </section>
+    <section class="settings-section">
+      <h3>Пароль расшифровки</h3>
+      <button id="change-decrypt-password" class="primary">Сменить пароль расшифровки (потеря истории)</button>
+      <p class="muted">Создаёт новый ключ E2EE с новым паролем. Вся локальная история и вложения станут недоступны. Собеседники получат новый публичный ключ автоматически.</p>
+    </section>
+    <section class="settings-section">
       <h3>Ключ шифрования</h3>
       <button id="rotate-key" class="primary">Сменить ключ</button>
-      <p class="muted">Старые сообщения станут недоступны.</p>
+      <p class="muted">Создаёт новый ключ с текущим паролем. Старые сообщения станут недоступны.</p>
+      <button id="reset-identity" class="mini danger" style="margin-top:8px">Сбросить ключ (потеря истории)</button>
     </section>
     <section class="settings-section">
       <h3>Активные сессии</h3>

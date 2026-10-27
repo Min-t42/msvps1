@@ -7,7 +7,7 @@ let historyKey = null;
 let sessionPassword = null;
 const history = {};
 let historyLoaded = false;
-const blobCache = new Map(); // fileId -> { url, mime, filename }
+const blobCache = new Map();
 
 const backBtns = [document.getElementById('back-btn'), document.getElementById('back-btn2')];
 const wsStatus = document.getElementById('ws-status');
@@ -15,13 +15,7 @@ const verifyBtn = document.getElementById('verify-btn');
 const MAX_FILE_SIZE = 35 * 1024 * 1024;
 
 const b64 = { enc: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))), dec: (s) => Uint8Array.from(atob(s), c => c.charCodeAt(0)) };
-const b64Blob = (buf) => {  // для больших буферов
-  const bytes = new Uint8Array(buf);
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-  return btoa(binary);
-};
+const b64Blob = (buf) => { const bytes = new Uint8Array(buf); let binary = ''; const chunk = 0x8000; for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)); return btoa(binary); };
 const b64ToBytes = (s) => { const bin = atob(s); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; };
 
 function uuid() {
@@ -159,82 +153,16 @@ function openDB() {
   });
   return dbPromise;
 }
-async function idbPutMsg(rec) {
-  try {
-    const db = await openDB();
-    return await new Promise((res, rej) => {
-      const tx = db.transaction(STORE_MSG, 'readwrite');
-      tx.objectStore(STORE_MSG).put(rec);
-      tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
-    });
-  } catch (e) { console.warn('[idbPutMsg]', e); }
-}
-async function idbGetAllMsgs() {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(STORE_MSG, 'readonly');
-    const req = tx.objectStore(STORE_MSG).getAll();
-    req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error);
-  });
-}
-async function idbUpdateStatus(user, id, status) {
-  try {
-    const db = await openDB();
-    await new Promise((res, rej) => {
-      const tx = db.transaction(STORE_MSG, 'readwrite');
-      const store = tx.objectStore(STORE_MSG);
-      const get = store.get(id);
-      get.onsuccess = () => { const rec = get.result; if (!rec || rec.user !== user) return; rec.status = status; store.put(rec); };
-      tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
-    });
-  } catch (e) { console.warn('[idbUpdateStatus]', e); }
-}
-async function idbClearAll(user) {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(STORE_MSG, 'readwrite');
-    const store = tx.objectStore(STORE_MSG);
-    const req = store.openCursor();
-    req.onsuccess = (ev) => { const c = ev.target.result; if (!c) return; if (c.value.user === user) c.delete(); c.continue(); };
-    tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
-  });
-}
-async function idbGetIdentity(user) {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(STORE_IDENT, 'readonly');
-    const req = tx.objectStore(STORE_IDENT).get(user);
-    req.onsuccess = () => res(req.result || null); req.onerror = () => rej(req.error);
-  });
-}
-async function idbPutIdentity(rec) {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(STORE_IDENT, 'readwrite');
-    tx.objectStore(STORE_IDENT).put(rec);
-    tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
-  });
-}
-async function idbGetVerified(peer) {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(STORE_VERIFIED, 'readonly');
-    const req = tx.objectStore(STORE_VERIFIED).get(peer);
-    req.onsuccess = () => res(req.result || null); req.onerror = () => rej(req.error);
-  });
-}
-async function idbPutVerified(rec) {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(STORE_VERIFIED, 'readwrite');
-    tx.objectStore(STORE_VERIFIED).put(rec);
-    tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
-  });
-}
-async function idbGetPending(user) {
-  const all = await idbGetAllMsgs();
-  return all.filter(r => r.user === user && r.status === 'pending');
-}
+async function idbPutMsg(rec) { try { const db = await openDB(); return await new Promise((res, rej) => { const tx = db.transaction(STORE_MSG, 'readwrite'); tx.objectStore(STORE_MSG).put(rec); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); } catch (e) { console.warn('[idbPutMsg]', e); } }
+async function idbGetAllMsgs() { const db = await openDB(); return new Promise((res, rej) => { const tx = db.transaction(STORE_MSG, 'readonly'); const req = tx.objectStore(STORE_MSG).getAll(); req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); }); }
+async function idbUpdateStatus(user, id, status) { try { const db = await openDB(); await new Promise((res, rej) => { const tx = db.transaction(STORE_MSG, 'readwrite'); const store = tx.objectStore(STORE_MSG); const get = store.get(id); get.onsuccess = () => { const rec = get.result; if (!rec || rec.user !== user) return; rec.status = status; store.put(rec); }; tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); } catch (e) { console.warn(e); } }
+async function idbClearAll(user) { const db = await openDB(); return new Promise((res, rej) => { const tx = db.transaction(STORE_MSG, 'readwrite'); const store = tx.objectStore(STORE_MSG); const req = store.openCursor(); req.onsuccess = (ev) => { const c = ev.target.result; if (!c) return; if (c.value.user === user) c.delete(); c.continue(); }; tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); }
+async function idbGetIdentity(user) { const db = await openDB(); return new Promise((res, rej) => { const tx = db.transaction(STORE_IDENT, 'readonly'); const req = tx.objectStore(STORE_IDENT).get(user); req.onsuccess = () => res(req.result || null); req.onerror = () => rej(req.error); }); }
+async function idbPutIdentity(rec) { const db = await openDB(); return new Promise((res, rej) => { const tx = db.transaction(STORE_IDENT, 'readwrite'); tx.objectStore(STORE_IDENT).put(rec); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); }
+async function idbDeleteIdentity(user) { const db = await openDB(); return new Promise((res, rej) => { const tx = db.transaction(STORE_IDENT, 'readwrite'); tx.objectStore(STORE_IDENT).delete(user); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); }
+async function idbGetVerified(peer) { const db = await openDB(); return new Promise((res, rej) => { const tx = db.transaction(STORE_VERIFIED, 'readonly'); const req = tx.objectStore(STORE_VERIFIED).get(peer); req.onsuccess = () => res(req.result || null); req.onerror = () => rej(req.error); }); }
+async function idbPutVerified(rec) { const db = await openDB(); return new Promise((res, rej) => { const tx = db.transaction(STORE_VERIFIED, 'readwrite'); tx.objectStore(STORE_VERIFIED).put(rec); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); }
+async function idbGetPending(user) { const all = await idbGetAllMsgs(); return all.filter(r => r.user === user && r.status === 'pending'); }
 
 async function loadHistory() {
   if (historyLoaded || !me || !historyKey) return;
@@ -258,18 +186,14 @@ async function loadHistory() {
         senderPubJwk: r.senderPubJwk,
         kind: payload.kind || 'text',
         text: payload.text,
-        fileId: payload.fileId,
-        filename: payload.filename,
-        mime: payload.mime,
-        size: payload.size,
-        fileIv: payload.fileIv,
+        fileId: payload.fileId, filename: payload.filename, mime: payload.mime, size: payload.size, fileIv: payload.fileIv,
       });
       n++;
     }
     for (const p of Object.keys(history)) history[p].sort((a, b) => a.ts - b.ts);
     historyLoaded = true;
-    console.log(`[minichat] restored ${n} encrypted messages`);
-  } catch (e) { console.error('[loadHistory]', e); }
+    console.log(`[minichat] restored ${n} messages`);
+  } catch (e) { console.error(e); }
 }
 
 // ---------- Auth ----------
@@ -319,25 +243,46 @@ function askPassword(title) {
     $('#unlock-password').value = ''; $('#unlock-error').textContent = ''; $('#unlock-password').focus();
     const submit = async () => {
       const pwd = $('#unlock-password').value; if (!pwd) return;
-      try { await unlockWithPassword(pwd); $('#unlock-modal').classList.add('hidden'); sessionPassword = pwd; resolve(true); }
-      catch { $('#unlock-error').textContent = 'Неверный пароль'; }
+      try {
+        await unlockWithPassword(pwd);
+        $('#unlock-modal').classList.add('hidden');
+        sessionPassword = pwd;
+        resolve(true);
+      } catch (e) {
+        console.error('[unlock]', e);
+        if (e.message === 'identity corrupted: no salt' || e.message === 'identity corrupted: no encrypted') {
+          $('#unlock-error').textContent = 'Ключ повреждён. Нажмите «Сбросить ключ» (история будет потеряна).';
+        } else if (e.name === 'OperationError') {
+          $('#unlock-error').textContent = 'Неверный пароль шифрования. Это пароль, с которым вы регистрировались.';
+        } else {
+          $('#unlock-error').textContent = 'Не удалось разблокировать: ' + e.message;
+        }
+      }
     };
     $('#unlock-btn').onclick = submit;
     $('#unlock-password').onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+    $('#unlock-reset').onclick = async () => {
+      $('#unlock-modal').classList.add('hidden');
+      await resetIdentity();
+    };
   });
 }
 async function unlockWithPassword(password) {
   const rec = await idbGetIdentity(me);
-  if (!rec) throw new Error('no identity');
-  masterBits = await deriveMaster(password, b64.dec(rec.salt));
-  identity = { publicJwk: rec.publicJwk, privateKey: await decryptPrivateKey(rec.encrypted, masterBits) };
+  if (!rec) throw new Error('identity not found');
+  const saltB64 = rec.salt || (rec.encrypted && rec.encrypted.salt);
+  if (!saltB64) throw new Error('identity corrupted: no salt');
+  if (!rec.encrypted || !rec.encrypted.iv || !rec.encrypted.ct) throw new Error('identity corrupted: no encrypted');
+  masterBits = await deriveMaster(password, b64.dec(saltB64));
+  const priv = await decryptPrivateKey(rec.encrypted, masterBits);
+  identity = { publicJwk: rec.publicJwk, privateKey: priv };
   historyKey = await deriveAes(masterBits, 'minichat-history');
 }
 async function ensureIdentity() {
   if (identity && historyKey) return;
   const rec = await idbGetIdentity(me);
   if (rec) {
-    if (sessionPassword) { try { await unlockWithPassword(sessionPassword); return; } catch { sessionPassword = null; } }
+    if (sessionPassword) { try { await unlockWithPassword(sessionPassword); return; } catch (e) { console.warn('[auto-unlock] failed:', e.message); sessionPassword = null; } }
     await askPassword('Расшифровка сообщений'); return;
   }
   let pwd = sessionPassword;
@@ -349,6 +294,7 @@ async function ensureIdentity() {
       const submit = () => { const v = $('#unlock-password').value; if (v) { $('#unlock-modal').classList.add('hidden'); resolve(v); } };
       $('#unlock-btn').onclick = submit;
       $('#unlock-password').onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+      $('#unlock-reset').onclick = null;
     });
   }
   const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -359,6 +305,16 @@ async function ensureIdentity() {
   identity = { publicJwk, privateKey };
   await api('/api/keys', { publicKey: publicJwk });
   console.log('[minichat] new identity created');
+}
+
+async function resetIdentity() {
+  if (!confirm('Сбросить ключ шифрования? Вся история на этом устройстве станет недоступной навсегда. Продолжить?')) return;
+  await idbDeleteIdentity(me);
+  await idbClearAll(me);
+  for (const url of blobCache.values()) URL.revokeObjectURL(url);
+  blobCache.clear();
+  alert('Ключ сброшен. Страница перезагрузится — при входе создастся новый ключ с текущим паролем.');
+  location.reload();
 }
 
 // ---------- Navigation ----------
@@ -431,13 +387,8 @@ function connectWS() {
       pushMessage(m.from, {
         id: m.id || null, from: m.from, ts: m.ts, offline: m.offline || false,
         senderPubJwk: m.senderPubJwk,
-        kind: payload.kind || 'text',
-        text: payload.text,
-        fileId: payload.fileId,
-        filename: payload.filename,
-        mime: payload.mime,
-        size: payload.size,
-        fileIv: payload.fileIv,
+        kind: payload.kind || 'text', text: payload.text,
+        fileId: payload.fileId, filename: payload.filename, mime: payload.mime, size: payload.size, fileIv: payload.fileIv,
         iv: m.iv, ct: m.ct,
       });
       if (m.from === currentPeer) renderMessages();
@@ -517,7 +468,7 @@ async function startChatWith(username) {
   await selectPeer(username);
 }
 
-// ---------- History ----------
+// ---------- History render ----------
 function pushMessage(peer, msg) {
   if (!history[peer]) history[peer] = [];
   if (msg.id && history[peer].some(m => m.id === msg.id)) return;
@@ -541,9 +492,6 @@ async function getBlobUrl(msg) {
   const r = await fetch('/api/files/' + encodeURIComponent(msg.fileId), { headers: { Authorization: 'Bearer ' + token } });
   if (!r.ok) throw new Error('Не удалось скачать файл');
   const encBuf = await r.arrayBuffer();
-  const other = msg.from === me ? msg.to : msg.from;
-  const peer = msg.from === me ? msg.peer : msg.from;
-  const peerName = msg.peer || msg.from;   // собеседник
   const sharedPeer = (msg.from === me) ? msg.peer : msg.from;
   const plain = await decryptFileBytes(sharedPeer, msg.fileIv, encBuf);
   const blob = new Blob([plain], { type: msg.mime || 'application/octet-stream' });
@@ -551,7 +499,6 @@ async function getBlobUrl(msg) {
   blobCache.set(msg.fileId, url);
   return url;
 }
-
 function renderMessages() {
   const box = $('#messages'); box.innerHTML = '';
   const icons = { pending: '⏳', sending: '·', queued: '⏳', delivered: '✓', failed: '✗', unknown: '?' };
@@ -581,9 +528,7 @@ function renderMessages() {
           const url = await getBlobUrl(m);
           if (!url) return;
           if ((m.mime || '').startsWith('video/') || (m.mime || '').startsWith('image/')) window.open(url, '_blank');
-          else {
-            const a = document.createElement('a'); a.href = url; a.download = m.filename || 'file'; a.click();
-          }
+          else { const a = document.createElement('a'); a.href = url; a.download = m.filename || 'file'; a.click(); }
         } catch (e) { alert(e.message); }
       };
       meta.appendChild(name); meta.appendChild(size); meta.appendChild(action);
@@ -625,31 +570,17 @@ $('#send-form').addEventListener('submit', async (e) => {
 // ---------- Send file ----------
 $('#attach-btn').addEventListener('click', () => $('#file-input').click());
 $('#file-input').addEventListener('change', async (e) => {
-  const file = e.target.files[0];
-  e.target.value = '';
+  const file = e.target.files[0]; e.target.value = '';
   if (!file) return;
   if (!currentPeer) { alert('Сначала выберите собеседника'); return; }
   if (!identity) { alert('Ключ не разблокирован'); return; }
   if (file.size > MAX_FILE_SIZE) { alert(`Файл слишком большой: ${fmtSize(file.size)}. Максимум 35 МБ.`); return; }
   if (file.size === 0) { alert('Пустой файл'); return; }
-  try {
-    await sendFile(file);
-  } catch (err) { alert('Ошибка отправки файла: ' + err.message); }
+  try { await sendFile(file); } catch (err) { alert('Ошибка отправки файла: ' + err.message); }
 });
-
-function showProgress(title) {
-  $('#progress-title').textContent = title || 'Передача файла';
-  $('#progress-text').textContent = 'Подготовка...';
-  $('#progress-fill').style.width = '0%';
-  $('#progress-error').textContent = '';
-  $('#progress-modal').classList.remove('hidden');
-}
-function updateProgress(pct, text) {
-  $('#progress-fill').style.width = Math.max(0, Math.min(100, pct * 100)).toFixed(1) + '%';
-  if (text) $('#progress-text').textContent = text;
-}
+function showProgress(title) { $('#progress-title').textContent = title || 'Передача файла'; $('#progress-text').textContent = 'Подготовка...'; $('#progress-fill').style.width = '0%'; $('#progress-error').textContent = ''; $('#progress-modal').classList.remove('hidden'); }
+function updateProgress(pct, text) { $('#progress-fill').style.width = Math.max(0, Math.min(100, pct * 100)).toFixed(1) + '%'; if (text) $('#progress-text').textContent = text; }
 function hideProgress() { $('#progress-modal').classList.add('hidden'); }
-
 async function uploadEncrypted(bytes, peer, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -659,20 +590,13 @@ async function uploadEncrypted(bytes, peer, onProgress) {
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try { resolve(JSON.parse(xhr.responseText)); }
-        catch (e) { reject(new Error('bad response')); }
-      } else {
-        let msg = 'HTTP ' + xhr.status;
-        try { const j = JSON.parse(xhr.responseText); if (j.error) msg = j.error; } catch {}
-        reject(new Error(msg));
-      }
+      if (xhr.status >= 200 && xhr.status < 300) { try { resolve(JSON.parse(xhr.responseText)); } catch { reject(new Error('bad response')); } }
+      else { let msg = 'HTTP ' + xhr.status; try { const j = JSON.parse(xhr.responseText); if (j.error) msg = j.error; } catch {} reject(new Error(msg)); }
     };
     xhr.onerror = () => reject(new Error('network error'));
     xhr.send(new Blob([bytes], { type: 'application/octet-stream' }));
   });
 }
-
 async function sendFile(file) {
   showProgress('Шифрование');
   updateProgress(0, 'Чтение файла...');
@@ -682,8 +606,7 @@ async function sendFile(file) {
   updateProgress(0.3, 'Загрузка на сервер...');
   const { fileId } = await uploadEncrypted(encCt, currentPeer, (p) => updateProgress(0.3 + p * 0.6, 'Загрузка: ' + Math.round(p * 100) + '%'));
   updateProgress(0.95, 'Отправка сообщения...');
-  const id = uuid();
-  const ts = Date.now();
+  const id = uuid(); const ts = Date.now();
   const meta = { kind: 'file', fileId, filename: file.name, mime: file.type || 'application/octet-stream', size: plainBuf.byteLength, fileIv };
   const enc = await encryptFor(currentPeer, JSON.stringify(meta));
   if (ws && ws.readyState === ws.OPEN) {
@@ -718,9 +641,8 @@ async function loadInvites() {
   for (const inv of data.invites) {
     const li = document.createElement('li'); li.className = 'invite-item' + (inv.used ? ' used' : '');
     const code = document.createElement('code'); code.textContent = inv.code; li.appendChild(code);
-    if (inv.used) {
-      const b = document.createElement('span'); b.className = 'badge'; b.textContent = inv.used_by ? `использован: ${inv.used_by}` : 'использован'; li.appendChild(b);
-    } else {
+    if (inv.used) { const b = document.createElement('span'); b.className = 'badge'; b.textContent = inv.used_by ? `использован: ${inv.used_by}` : 'использован'; li.appendChild(b); }
+    else {
       const copy = document.createElement('button'); copy.className = 'mini'; copy.textContent = 'Скопировать';
       copy.addEventListener('click', async () => {
         const link = `${location.origin}/?invite=${inv.code}`;
@@ -743,6 +665,107 @@ async function loadInvites() {
 // ---------- Settings ----------
 $('#open-settings').addEventListener('click', () => { $('#settings-modal').classList.remove('hidden'); loadSessions(); });
 $('#close-settings').addEventListener('click', () => $('#settings-modal').classList.add('hidden'));
+
+// Смена пароля входа (с перешифровкой текущего ключа)
+$('#change-password').addEventListener('click', async () => {
+  const err = (m) => { $('#settings-error').textContent = m; };
+  err('');
+  const cur = prompt('Текущий пароль входа:');
+  if (!cur) return;
+  const next = prompt('Новый пароль входа (мин. 8 символов):');
+  if (!next || next.length < 8) { err('Новый пароль слишком короткий (мин. 8).'); return; }
+  if (next === cur) { err('Новый пароль совпадает с текущим.'); return; }
+  const again = prompt('Повторите новый пароль:');
+  if (again !== next) { err('Пароли не совпадают.'); return; }
+
+  let oldPriv;
+  try {
+    const rec = await idbGetIdentity(me);
+    if (!rec) throw new Error('Ключ не найден в этом браузере.');
+    const saltB64 = rec.salt || (rec.encrypted && rec.encrypted.salt);
+    const oldMaster = await deriveMaster(cur, b64.dec(saltB64));
+    oldPriv = await decryptPrivateKey(rec.encrypted, oldMaster);
+  } catch (e) {
+    err('Текущий пароль неверный (или ключ повреждён): ' + e.message);
+    return;
+  }
+
+  const newSalt = crypto.getRandomValues(new Uint8Array(16));
+  const newMaster = await deriveMaster(next, newSalt);
+  const newEncrypted = await encryptPrivateKey(oldPriv, newMaster);
+
+  try { await api('/api/change-password', { currentPassword: cur, newPassword: next }); }
+  catch (e) { err('Сервер отклонил смену пароля: ' + e.message); return; }
+
+  const rec = await idbGetIdentity(me);
+  await idbPutIdentity({ user: me, publicJwk: rec.publicJwk, encrypted: newEncrypted, salt: b64.enc(newSalt) });
+
+  sessionPassword = next;
+  masterBits = newMaster;
+  identity = { publicJwk: rec.publicJwk, privateKey: oldPriv };
+  historyKey = await deriveAes(newMaster, 'minichat-history');
+
+  alert('Пароль входа изменён. Остальные сессии завершены. Ключ E2EE перешифрован — история сохранена.');
+  loadSessions();
+});
+
+// Смена пароля расшифровки (создаёт НОВЫЙ ключ, теряет историю)
+$('#change-decrypt-password').addEventListener('click', async () => {
+  const err = (m) => { $('#settings-error').textContent = m; };
+  err('');
+
+  const ok = confirm(
+    'Сменить пароль расшифровки?\n\n' +
+    'Будет создан НОВЫЙ ключ шифрования с новым паролем.\n' +
+    'ВСЕ предыдущие сообщения и вложения на этом устройстве станут недоступны навсегда.\n' +
+    'Собеседники получат ваш новый публичный ключ автоматически.\n\n' +
+    'Продолжить?'
+  );
+  if (!ok) return;
+
+  const next = prompt('Новый пароль для расшифровки (минимум 8 символов):');
+  if (!next) return;
+  if (next.length < 8) { err('Пароль слишком короткий (мин. 8).'); return; }
+  const again = prompt('Повторите новый пароль:');
+  if (again !== next) { err('Пароли не совпадают.'); return; }
+
+  const ok2 = confirm('Последнее подтверждение: старая история будет удалена без возможности восстановления. Сменить ключ?');
+  if (!ok2) return;
+
+  try {
+    // 1. Новый ключ ECDH, зашифрованный новым паролем
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const newMaster = await deriveMaster(next, salt);
+    const { publicJwk, privateKey, encrypted } = await createIdentity(newMaster);
+
+    // 2. Сохраняем новую identity
+    await idbPutIdentity({ user: me, publicJwk, encrypted, salt: b64.enc(salt) });
+    identity = { publicJwk, privateKey };
+    masterBits = newMaster;
+    historyKey = await deriveAes(newMaster, 'minichat-history');
+    sessionPassword = next;
+
+    // 3. Публикуем новый публичный ключ
+    await api('/api/keys', { publicKey: publicJwk });
+
+    // 4. Очищаем кэши ключей собеседников и blob-URL
+    peerKeyCache.clear();
+    for (const url of blobCache.values()) URL.revokeObjectURL(url);
+    blobCache.clear();
+
+    // 5. Очищаем историю сообщений (она зашифрована старым historyKey)
+    await idbClearAll(me);
+    for (const k of Object.keys(history)) delete history[k];
+    historyLoaded = false;
+
+    alert('Ключ изменён. Старая история удалена. Собеседники получат новый публичный ключ автоматически при следующей отправке.');
+    location.reload();
+  } catch (e) {
+    err('Не удалось сменить ключ: ' + e.message);
+  }
+});
+
+// Смена ключа с текущим паролем (без смены пароля)
 $('#rotate-key').addEventListener('click', async () => {
   if (!confirm('Сменить ключ? Старые сообщения станут недоступны.')) return;
   try {
@@ -759,6 +782,9 @@ $('#rotate-key').addEventListener('click', async () => {
     alert('Ключ обновлён.');
   } catch (e) { $('#settings-error').textContent = e.message; }
 });
+
+$('#reset-identity').addEventListener('click', resetIdentity);
+
 async function loadSessions() {
   const ul = $('#sessions-list'); ul.innerHTML = '';
   try {
