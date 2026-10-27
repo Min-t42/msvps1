@@ -96,10 +96,39 @@ db.exec(`
   if (!cols.includes('created_by')) { db.exec('ALTER TABLE invites ADD COLUMN created_by TEXT'); console.log('migration: invites.created_by'); }
 }
 {
+  // 1. Добавить недостающие колонки (для старых БД)
   const cols = db.prepare('PRAGMA table_info(offline_messages)').all().map(c => c.name);
-  if (!cols.includes('iv')) { db.exec('ALTER TABLE offline_messages ADD COLUMN iv TEXT'); }
-  if (!cols.includes('ct')) { db.exec('ALTER TABLE offline_messages ADD COLUMN ct TEXT'); }
-  if (!cols.includes('sender_pub_jwk')) { db.exec('ALTER TABLE offline_messages ADD COLUMN sender_pub_jwk TEXT'); }
+  if (!cols.includes('iv')) { db.exec('ALTER TABLE offline_messages ADD COLUMN iv TEXT'); console.log('migration: offline_messages.iv'); }
+  if (!cols.includes('ct')) { db.exec('ALTER TABLE offline_messages ADD COLUMN ct TEXT'); console.log('migration: offline_messages.ct'); }
+  if (!cols.includes('sender_pub_jwk')) { db.exec('ALTER TABLE offline_messages ADD COLUMN sender_pub_jwk TEXT'); console.log('migration: offline_messages.sender_pub_jwk'); }
+
+  // 2. Если text был NOT NULL — пересобрать таблицу (ALTER COLUMN в SQLite не работает)
+  const info = db.prepare('PRAGMA table_info(offline_messages)').all();
+  const textCol = info.find(c => c.name === 'text');
+  if (textCol && textCol.notnull === 1) {
+    console.log('migration: rebuilding offline_messages (text NOT NULL -> nullable)');
+    db.exec(`
+      CREATE TABLE offline_messages_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        msg_id TEXT,
+        to_user TEXT NOT NULL,
+        from_user TEXT NOT NULL,
+        text TEXT,
+        iv TEXT,
+        ct TEXT,
+        sender_pub_jwk TEXT,
+        ts INTEGER NOT NULL
+      );
+      INSERT INTO offline_messages_new (id, msg_id, to_user, from_user, text, iv, ct, sender_pub_jwk, ts)
+        SELECT id, msg_id, to_user, from_user, text, iv, ct, sender_pub_jwk, ts FROM offline_messages;
+      DROP TABLE offline_messages;
+      ALTER TABLE offline_messages_new RENAME TO offline_messages;
+      CREATE INDEX IF NOT EXISTS idx_offline_to ON offline_messages(to_user);
+    `);
+    console.log('migration: offline_messages rebuilt');
+  }
+
+  // 3. Удалить старые открытые сообщения (без iv/ct), которые всё равно не расшифровать
   const r = db.prepare('DELETE FROM offline_messages WHERE iv IS NULL OR ct IS NULL').run();
   if (r.changes > 0) console.log(`migration: removed ${r.changes} unencrypted offline messages`);
 }
